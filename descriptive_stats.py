@@ -1,8 +1,5 @@
 import pandas as pd
-
-# Load the CSV file
-file_path_mortgages = r"G:\My Drive\Master\Thesis\Andrei_thesis_KRIF_mortgages_vPaul.csv"
-file_path_applications = r"G:\My Drive\Master\Thesis\Andrei_thesis_KRIF_application_vPaul.csv"
+from vars import file_path_mortgages, file_path_applications
 
 for file_path in [file_path_mortgages, file_path_applications]:
     print(file_path)
