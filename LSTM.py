@@ -1,12 +1,10 @@
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import LabelEncoder
-from datetime import datetime
 import numpy as np
-from encoding_mortgage import df_mortgages
+from MTLFormer.encoding_mortgage import df_mortgages
 
 # Assuming the processed data is stored in `processed_df`
 processed_df = df_mortgages

@@ -1,11 +1,9 @@
-# TODO: Redesign this file (its copy pasted form my MTLFormer replication repo)
 from MTLFormer import MTLFormer, train_model
 from evaluate import evaluate_model
+import torch
 from torch import optim
 from dataloader import train_loader, val_loader
 
-# TODO: Fix embed_size having to be same as num_classes atm, then check paper for hyperparams
-# TODO: Why does it ask for 235 when we have 233 next activity options
 # Model hyperparameters
 embed_size = 235
 heads = 5
@@ -14,6 +12,11 @@ num_classes = 235  # For next activity prediction
 
 # Instantiate model
 model = MTLFormer(embed_size, heads, dropout, num_classes)
+
+# Check if CUDA is available and move the model to GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+print('Device: ', device)
 
 # Optimizer
 optimizer = optim.Adam(model.parameters(), lr=0.002)

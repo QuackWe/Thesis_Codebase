@@ -65,15 +65,17 @@ def multitask_loss(activity_pred, time_pred, remaining_pred, activity_label, tim
 
 # Training loop
 def train_model(model, dataloader, optimizer, weights, num_epochs=100):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0
         for batch in dataloader:
             # Get data for each task
-            sequences = batch['sequence']  # Activity sequences (input features)
-            next_activity_labels = batch['next_activity']  # Next activity (classification labels)
-            next_event_time_labels = batch['next_event_time']  # Next event time (regression labels)
-            remaining_time_labels = batch['remaining_time']  # Remaining time (regression labels)
+            sequences = batch['sequence'].to(device)  # Activity sequences (input features)
+            next_activity_labels = batch['next_activity'].to(device)  # Next activity (classification labels)
+            next_event_time_labels = batch['next_event_time'].to(device)  # Next event time (regression labels)
+            remaining_time_labels = batch['remaining_time'].to(device)  # Remaining time (regression labels)
 
             # Forward pass
             activity_pred, time_pred, remaining_pred = model(sequences)

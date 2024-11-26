@@ -3,6 +3,8 @@ import torch
 
 # Evaluation for classification and regression tasks
 def evaluate_model(model, dataloader):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
     model.eval()
     total_activity_correct = 0
     total_samples = 0
@@ -12,10 +14,10 @@ def evaluate_model(model, dataloader):
     with torch.no_grad():
         for batch in dataloader:
             # Get data for each task
-            sequences = batch['sequence']  # Activity sequences (input features)
-            next_activity_labels = batch['next_activity']  # Next activity (classification labels)
-            next_event_time_labels = batch['next_event_time']  # Next event time (regression labels)
-            remaining_time_labels = batch['remaining_time']  # Remaining time (regression labels)
+            sequences = batch['sequence'].to(device)  # Activity sequences (input features)
+            next_activity_labels = batch['next_activity'].to(device)  # Next activity (classification labels)
+            next_event_time_labels = batch['next_event_time'].to(device)  # Next event time (regression labels)
+            remaining_time_labels = batch['remaining_time'].to(device)  # Remaining time (regression labels)
 
             # Forward pass
             activity_pred, time_pred, remaining_pred = model(sequences)
@@ -37,7 +39,7 @@ def evaluate_model(model, dataloader):
     avg_time_mae = total_time_mae / total_samples
     avg_remaining_mae = total_remaining_mae / total_samples
 
-    print(f'Accuracy for next activity: {accuracy:.4f}')
-    print(f'MAE for next event time: {avg_time_mae:.4f}')
-    print(f'MAE for remaining time: {avg_remaining_mae:.4f}')
+    # print(f'Accuracy for next activity: {accuracy:.4f}')
+    # print(f'MAE for next event time: {avg_time_mae:.4f}')
+    # print(f'MAE for remaining time: {avg_remaining_mae:.4f}')
     return accuracy, avg_time_mae, avg_remaining_mae
