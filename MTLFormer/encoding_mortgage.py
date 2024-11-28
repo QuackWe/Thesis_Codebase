@@ -5,7 +5,12 @@ import numpy as np
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder, MinMaxScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from datetime import datetime
-from vars import file_path_mortgages
+
+
+working_directory = "K:/Klanten/De Volksbank/Thesis Andrei"
+file_path_mortgages = working_directory + "/Andrei_thesis_KRIF_mortgages_vPaul_v2.csv"
+file_path_applications = working_directory + "/Andrei_thesis_KRIF_application_vPaul_v2.csv"
+
 
 def load_mortgages(path):
     # Load data
@@ -108,7 +113,7 @@ df_mortgages['final_outcome_encoded'] = label_encoder.fit_transform(df_mortgages
 
 # Now you can convert the encoded labels into tensors
 y_activity = torch.tensor(df_mortgages['next_activity_encoded'].values, dtype=torch.long)
-print(len(torch.unique(y_activity)))
+
 # Now you can convert the encoded labels into tensors
 y_outcome = torch.tensor(df_mortgages['final_outcome_encoded'].values, dtype=torch.long)
 

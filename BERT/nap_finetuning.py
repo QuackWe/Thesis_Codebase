@@ -1,21 +1,22 @@
-import os
 import json
 import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+import os
+
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from transformers import (
     BertTokenizer,
-    BertModel,
     BertForMaskedLM,
+    BertModel,
+    BertForSequenceClassification,
     AdamW,
-    BertPreTrainedModel,
+    get_linear_schedule_with_warmup,
 )
+from transformers.models.bert.modeling_bert import BertPooler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 
 # Set device (GPU or CPU)
@@ -37,9 +38,11 @@ VAL_SIZE = 0.1   # 10% of data for validation (from remaining 90%)
 # Load the tokenizer and pre-trained MAM model
 tokenizer = BertTokenizer.from_pretrained(MAM_MODEL_PATH)
 mam_model = BertForMaskedLM.from_pretrained(MAM_MODEL_PATH)
-config = mam_model.config  # Load configuration
 
-# Load and preprocess the dataset
+# Load the configuration from the MAM model
+config = mam_model.config
+
+# Load the data
 df = pd.read_csv(DATA_FILE)
 
 # Create label mappings
@@ -47,8 +50,7 @@ unique_activities = df['MaskedActivity'].unique().tolist()
 label_map = {activity: idx for idx, activity in enumerate(unique_activities)}
 id_to_label = {idx: activity for activity, idx in label_map.items()}
 num_labels = len(label_map)
-config.num_labels = num_labels  # Update the number of labels in the config
-class_weights = np.ones(num_labels, dtype=np.float32) # Initialize class_weights with ones
+config.num_labels = num_labels
 
 # Save label mappings
 if not os.path.exists(FINE_TUNED_MODEL_PATH):
@@ -56,73 +58,29 @@ if not os.path.exists(FINE_TUNED_MODEL_PATH):
 with open(LABEL_MAP_PATH, 'w') as f:
     json.dump(label_map, f)
 
+# Initialize BertModel without the pooling layer and add the pooler layer manually
+bert_model = BertModel(config, add_pooling_layer=False)
+bert_model.pooler = BertPooler(config)
+bert_model.pooler.apply(bert_model._init_weights)
 
-# Custom Model with Global Average Pooling (GAP)
-class CustomBertForNextActivityPrediction(BertPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.bert = BertModel(config)  # Use the BERT encoder
-        self.global_avg_pooling = nn.AdaptiveAvgPool1d(1)  # GAP layer
-        self.dropout = nn.Dropout(p=config.hidden_dropout_prob)  # Dropout layer
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)  # Classification layer
+# Load pre-trained weights into bert_model
+bert_model.load_state_dict(mam_model.bert.state_dict(), strict=False)
 
-        # Initialize weights and apply final processing
-        self.post_init()
+# Initialize the sequence classification model and replace its BertModel
+model = BertForSequenceClassification(config)
+model.bert = bert_model
 
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-    ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+# Move the model to the device
+model.to(device)
 
-        # Forward pass through BERT
-        outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+# Verify the pooler layer is present
+print("Is the pooler layer present in model.bert?", hasattr(model.bert, 'pooler'))
 
-        hidden_states = outputs.last_hidden_state  # Shape: [batch_size, seq_len, hidden_size]
+# Split the data into train, validation, and test sets
+train_val_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=42)
+train_df, val_df = train_test_split(train_val_df, test_size=VAL_SIZE / (1 - TEST_SIZE), random_state=42)
 
-        # Apply Global Average Pooling (GAP)
-        gap_input = hidden_states.permute(0, 2, 1)  # Shape: [batch_size, hidden_size, seq_len]
-        pooled_output = self.global_avg_pooling(gap_input).squeeze(-1)  # Shape: [batch_size, hidden_size]
-
-        # Apply dropout
-        dropped_out = self.dropout(pooled_output)  # Shape: [batch_size, hidden_size]
-
-        # Pass through the classifier
-        logits = self.classifier(dropped_out)  # Shape: [batch_size, num_labels]
-
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]  # Skip past hidden states and attentions
-            return ((loss,) + output) if loss is not None else output
-
-        return {'loss': loss, 'logits': logits, 'hidden_states': outputs.hidden_states,
-                'attentions': outputs.attentions}
-
-
-# Dataset Class for Next Activity Prediction
+# Define the dataset class
 class NextActivityDataset(Dataset):
     def __init__(self, dataframe, tokenizer, label_map, max_len=128):
         self.data = dataframe.reset_index(drop=True)
@@ -134,7 +92,6 @@ class NextActivityDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # Extract the prefix and masked activity
         prefix = eval(self.data.loc[idx, 'Prefix'])  # Convert string to list
         next_activity = self.data.loc[idx, 'MaskedActivity']
 
@@ -153,9 +110,7 @@ class NextActivityDataset(Dataset):
 
         input_ids = encoding['input_ids'].squeeze()
         attention_mask = encoding['attention_mask'].squeeze()
-
-        # Generate position_ids
-        position_ids = torch.arange(self.max_len, dtype=torch.long)  # Shape: [max_len]
+        position_ids = torch.arange(self.max_len, dtype=torch.long)
 
         # Get label ID
         label_id = self.label_map[next_activity]
@@ -167,11 +122,7 @@ class NextActivityDataset(Dataset):
             'labels': torch.tensor(label_id, dtype=torch.long)
         }
 
-
-# Prepare data for training and validation
-train_val_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=42)
-train_df, val_df = train_test_split(train_val_df, test_size=VAL_SIZE / (1 - TEST_SIZE), random_state=42)
-
+# Create datasets and data loaders
 train_dataset = NextActivityDataset(train_df, tokenizer, label_map, max_len=MAX_LEN)
 val_dataset = NextActivityDataset(val_df, tokenizer, label_map, max_len=MAX_LEN)
 test_dataset = NextActivityDataset(test_df, tokenizer, label_map, max_len=MAX_LEN)
@@ -180,45 +131,18 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-
-# Initialize and Prepare Model
-model = CustomBertForNextActivityPrediction(config)
-model.bert.load_state_dict(mam_model.bert.state_dict(), strict=False)  # Load MAM weights
-model.init_weights()
-model.to(device)
-
-# Set up optimizer and learning rate scheduler
+# Set up the optimizer and learning rate scheduler
 optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
-
-# Compute class weights for balanced loss
-# Map 'MaskedActivity' to label IDs in the training data
-y_series = train_dataset.data['MaskedActivity'].map(label_map)
-y = y_series.values.astype(int)
-
-# Get unique classes present in y
-present_classes = np.unique(y)
-
-# Compute class weights for classes present in y
-class_weights_present = compute_class_weight(
-    class_weight='balanced',
-    classes=present_classes,
-    y=y
+total_steps = NUM_EPOCHS * len(train_loader)
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=0,
+    num_training_steps=total_steps
 )
 
-# Initialize class_weights with ones
-class_weights = np.ones(num_labels, dtype=np.float32)
-
-# Update weights for classes present in y
-for idx, class_id in enumerate(present_classes):
-    class_weights[class_id] = class_weights_present[idx]
-class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-
-
-# Training and Validation Loop
+# Training loop
 for epoch in range(NUM_EPOCHS):
-    # Training Phase
+    # Training phase
     model.train()
     total_train_loss = 0
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Training]")
@@ -229,15 +153,11 @@ for epoch in range(NUM_EPOCHS):
         position_ids = batch['position_ids'].to(device)
         labels = batch['labels'].to(device)
 
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            labels=labels,
-        )
-        loss = outputs["loss"]
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels)
+        loss = outputs.loss
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         total_train_loss += loss.item()
         progress_bar.set_postfix({'loss': total_train_loss / (progress_bar.n + 1)})
@@ -245,25 +165,23 @@ for epoch in range(NUM_EPOCHS):
     avg_train_loss = total_train_loss / len(train_loader)
     print(f"Epoch {epoch+1}: Training completed. Average Loss: {avg_train_loss:.4f}")
 
-    # Validation Phase
+    # Validation phase
     model.eval()
     total_val_loss = 0
     total_correct = 0
     total_examples = 0
+
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Validation]"):
+        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Validation]")
+        for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             position_ids = batch['position_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
-            logits = outputs["logits"]
-            loss = loss_fn(logits, labels)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
 
             total_val_loss += loss.item()
             predictions = torch.argmax(logits, dim=-1)
@@ -272,13 +190,7 @@ for epoch in range(NUM_EPOCHS):
 
     avg_val_loss = total_val_loss / len(val_loader)
     accuracy = total_correct / total_examples
-    print(f"Epoch {epoch+1}: Validation completed. Loss: {avg_val_loss:.4f}, Accuracy: {accuracy:.4f}")
-    scheduler.step(avg_val_loss)
-
-    # Optionally, print the current learning rate
-    for param_group in optimizer.param_groups:
-        current_lr = param_group['lr']
-    print(f"Current Learning Rate after Epoch {epoch + 1}: {current_lr}")
+    print(f"Epoch {epoch+1}: Validation completed. Average Loss: {avg_val_loss:.4f}, Accuracy: {accuracy:.4f}")
 
 # Evaluation on the test set
 model.eval()
@@ -296,13 +208,9 @@ with torch.no_grad():
         position_ids = batch['position_ids'].to(device)
         labels = batch['labels'].to(device)
 
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
-        logits = outputs["logits"]
-        loss = loss_fn(logits, labels)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels)
+        loss = outputs.loss
+        logits = outputs.logits
 
         total_test_loss += loss.item()
         predictions = torch.argmax(logits, dim=-1)
@@ -357,11 +265,12 @@ def predict_next_activity(prefix_activities):
 
     input_ids = encoding['input_ids'].to(device)
     attention_mask = encoding['attention_mask'].to(device)
+    position_ids = torch.arange(MAX_LEN, dtype=torch.long).unsqueeze(0).to(device)
 
     model.eval()
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs['logits']
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        logits = outputs.logits
         predicted_class_id = logits.argmax().item()
         predicted_activity = id_to_label[predicted_class_id]
 

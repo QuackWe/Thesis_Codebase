@@ -1,5 +1,5 @@
 import pandas as pd
-from MTLFormer.vars import file_path_mortgages, file_path_applications
+from MTLFormer.encoding_mortgage import file_path_mortgages, file_path_applications
 
 for file_path in [file_path_mortgages, file_path_applications]:
     print(file_path)
