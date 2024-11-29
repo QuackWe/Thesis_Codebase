@@ -3,4 +3,4 @@
 !requirements.txt
 *.txt
 *.csv
-*.savetensors
+*.safetensors
