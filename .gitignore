@@ -4,3 +4,4 @@
 *.txt
 *.csv
 *.safetensors
+.pickle
