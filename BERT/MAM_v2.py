@@ -190,7 +190,9 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
 torch.set_printoptions(threshold=10000, edgeitems=10, linewidth=1000)
 
 # Set up training components
-def setup_training(data_file, batch_size=16, learning_rate=5e-5, num_epochs=3, print_examples=False, save_model=True, save_path='saved_model'):
+def setup_training(
+        data_file, batch_size=16, learning_rate=5e-5, num_epochs=3,
+        print_examples=False, save_model=True, save_path='datasets/'+log+'/saved_model'):
     """
     Prepare the data, model, optimizer, and device for MAM training.
     :param data_file: Path to the preprocessed dataset.
@@ -226,4 +228,6 @@ def setup_training(data_file, batch_size=16, learning_rate=5e-5, num_epochs=3, p
         tokenizer.save_pretrained(save_path)
 
 # Start training
-setup_training(data_file, batch_size=16, learning_rate=5e-5, num_epochs=10, save_model=True, save_path='mam_pretrained_model')
+setup_training(
+    data_file, batch_size=16, learning_rate=5e-5, num_epochs=10,
+    save_model=True, save_path='datasets/'+log+'/mam_pretrained_model')

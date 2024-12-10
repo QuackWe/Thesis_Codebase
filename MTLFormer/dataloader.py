@@ -1,8 +1,21 @@
+import os
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from encoding_mortgage import X, y_activity, y_outcome, y_next_time, y_remaining_time
+import torch
+from sys import argv
 
+
+# Directory setup
+log = argv[1]
+dataset_path = os.path.join('datasets', log)
+
+# Load data from files
+X = torch.load(os.path.join(dataset_path, "X.pt"))
+y_activity = torch.load(os.path.join(dataset_path, "y_activity.pt"))
+y_outcome = torch.load(os.path.join(dataset_path, "y_outcome.pt"))
+y_next_time = torch.load(os.path.join(dataset_path, "y_next_time.pt"))
+y_remaining_time = torch.load(os.path.join(dataset_path, "y_remaining_time.pt"))
 
 # Set batch size
 batch_size = 64

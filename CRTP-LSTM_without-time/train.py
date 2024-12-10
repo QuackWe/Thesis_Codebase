@@ -3,9 +3,11 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, LSTM, Dropout, Flatten, Concatenate, TimeDistributed
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint
+from sys import argv
 import numpy as np
-from utils import BagDataGenerator, read_data
-import helpers
+from lib.utils import BagDataGenerator, read_data
+import lib.helpers as helpers
+log = argv[1]
 
 # Set seed for reproducibility
 tf.random.set_seed(42)
@@ -16,7 +18,7 @@ output_dim = 50
 epochs = 10
 learning_rate = 0.001
 
-data_directory = "./data/"
+data_directory = './datasets/' + log + '/'
 
 # Load Data
 data, data_train, data_valid, data_test = read_data(data_directory)
@@ -82,7 +84,7 @@ model.compile(optimizer=Adam(learning_rate=learning_rate),
               metrics=['accuracy'])
 
 # Callbacks
-checkpoint = ModelCheckpoint(filepath='model_checkpoint.h5', save_best_only=True, monitor='val_loss', mode='min')
+checkpoint = ModelCheckpoint(filepath='datasets/'+log+'/model_checkpoint.h5', save_best_only=True, monitor='val_loss', mode='min')
 
 # Model Training
 model.fit(train_generator,

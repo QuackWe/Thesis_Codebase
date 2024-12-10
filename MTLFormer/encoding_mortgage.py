@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import torch
 from sympy.stats.sampling.sample_numpy import numpy
@@ -5,11 +6,16 @@ import numpy as np
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder, MinMaxScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from datetime import datetime
+from sys import argv
 
 
+log = argv[1]
+dataset_path = 'datasets/'+log
 working_directory = "K:/Klanten/De Volksbank/Thesis Andrei"
 file_path_mortgages = working_directory + "/Andrei_thesis_KRIF_mortgages_vPaul_v2.csv"
 file_path_applications = working_directory + "/Andrei_thesis_KRIF_application_vPaul_v2.csv"
+# Create the directory if it doesn't exist
+os.makedirs("datasets/"+log, exist_ok=True)
 
 
 def load_mortgages(path):
@@ -99,7 +105,8 @@ df_mortgages[['next_event_time', 'remaining_time']] = scaler.fit_transform(df_mo
 df_mortgages = generate_labels(df_mortgages)
 
 # Features (activity sequences in one-hot encoded format)
-X = torch.tensor(df_mortgages_onehot.filter(like='Activity_').values, dtype=torch.float32)
+X = df_mortgages_onehot.filter(like='Activity_').values
+torch.save(torch.tensor(X, dtype=torch.float32), os.path.join(dataset_path, "X.pt"))
 
 # Initialize LabelEncoder
 label_encoder = LabelEncoder()
@@ -112,16 +119,20 @@ df_mortgages['final_outcome_encoded'] = label_encoder.fit_transform(df_mortgages
 
 
 # Now you can convert the encoded labels into tensors
-y_activity = torch.tensor(df_mortgages['next_activity_encoded'].values, dtype=torch.long)
+y_activity = df_mortgages['next_activity_encoded'].values
+torch.save(torch.tensor(y_activity, dtype=torch.long), os.path.join(dataset_path, "y_activity.pt"))
 
 # Now you can convert the encoded labels into tensors
-y_outcome = torch.tensor(df_mortgages['final_outcome_encoded'].values, dtype=torch.long)
+y_outcome = df_mortgages['final_outcome_encoded'].values
+torch.save(torch.tensor(y_outcome, dtype=torch.long), os.path.join(dataset_path, "y_outcome.pt"))
 
 # Next event time (target for regression)
-y_next_time = torch.tensor(df_mortgages['next_event_time'].values, dtype=torch.float32)
+y_next_time = df_mortgages['next_event_time'].values
+torch.save(torch.tensor(y_next_time, dtype=torch.float32), os.path.join(dataset_path, "y_next_time.pt"))
 
 # Remaining time (target for regression)
-y_remaining_time = torch.tensor(df_mortgages['remaining_time'].values, dtype=torch.float32)
+y_remaining_time = df_mortgages['remaining_time'].values
+torch.save(torch.tensor(y_remaining_time, dtype=torch.float32), os.path.join(dataset_path, "y_remaining_time.pt"))
 
 # # Display the processed
 # with pd.option_context('display.max_columns', 85):

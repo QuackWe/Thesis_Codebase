@@ -1,9 +1,14 @@
 import pandas as pd
 import re
+from sys import argv
+import os
+log = argv[1]
 
 working_directory = "K:/Klanten/De Volksbank/Thesis Andrei"
 file_path_mortgages = working_directory + "/Andrei_thesis_KRIF_mortgages_vPaul_v2.csv"
 file_path_applications = working_directory + "/Andrei_thesis_KRIF_application_vPaul_v2.csv"
+# Create the directory if it doesn't exist
+os.makedirs("datasets/"+log, exist_ok=True)
 
 # Load your raw dataset
 raw_data = pd.read_csv(file_path_mortgages, encoding='latin-1')
@@ -71,7 +76,7 @@ final_columns = ['CaseID', 'trace', 'time_column1', 'time_column2', 'cat_column1
 final_data = aggregated_data[final_columns]
 
 # Save the final dataset to a CSV file
-final_data.to_csv('data/data.csv', index=False)
+final_data.to_csv('datasets/'+log+'/data.csv', index=False)
 
 # Create train, validation, and test index files
 case_ids = final_data['CaseID'].unique()
@@ -79,6 +84,6 @@ train_ids = case_ids[:int(0.7 * len(case_ids))]
 valid_ids = case_ids[int(0.7 * len(case_ids)):int(0.85 * len(case_ids))]
 test_ids = case_ids[int(0.85 * len(case_ids)):]
 
-pd.DataFrame(train_ids, columns=['CaseID']).to_csv('data/train_index.csv', index=False)
-pd.DataFrame(valid_ids, columns=['CaseID']).to_csv('data/valid_index.csv', index=False)
-pd.DataFrame(test_ids, columns=['CaseID']).to_csv('data/test_index.csv', index=False)
+pd.DataFrame(train_ids, columns=['CaseID']).to_csv('datasets/'+log+'/train_index.csv', index=False)
+pd.DataFrame(valid_ids, columns=['CaseID']).to_csv('datasets/'+log+'/valid_index.csv', index=False)
+pd.DataFrame(test_ids, columns=['CaseID']).to_csv('datasets/'+log+'/test_index.csv', index=False)
