@@ -1,7 +1,7 @@
 import json
 import numpy as np
 import pandas as pd
-
+from sys import argv
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -23,16 +23,17 @@ from tqdm import tqdm
 # Set up device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Device:", device)
+log = argv[1]
 
 # Load the tokenizer and pre-trained MAM model
-tokenizer = BertTokenizer.from_pretrained('mam_pretrained_model')
-mam_model = BertForMaskedLM.from_pretrained('mam_pretrained_model')
+tokenizer = BertTokenizer.from_pretrained('datasets/'+log+'/mam_pretrained_model')
+mam_model = BertForMaskedLM.from_pretrained('datasets/'+log+'/mam_pretrained_model')
 
 # Load the configuration from the MAM model
 config = mam_model.config
 
 # Load and preprocess the data
-event_log_file = 'mortgages_processed.csv'
+event_log_file = 'datasets/'+log+'/'+log+'_processed.csv'
 df = pd.read_csv(event_log_file, parse_dates=['Timestamp'])
 df = df.sort_values(by=['CaseID', 'Timestamp'])
 
@@ -62,7 +63,7 @@ label_map = {outcome: idx for idx, outcome in enumerate(unique_outcomes)}
 id_to_label = {idx: outcome for outcome, idx in label_map.items()}
 
 # Save label mappings for future use
-with open('outcome_label_map.json', 'w') as f:
+with open('datasets/'+log+'/outcome_label_map.json', 'w') as f:
     json.dump(label_map, f)
 
 # Initialize a new BertModel without the pooling layer
@@ -102,9 +103,9 @@ train_df, val_df = train_test_split(
 )
 
 # Save the datasets to CSV
-train_df.to_csv('outcome_train.csv', index=False)
-val_df.to_csv('outcome_val.csv', index=False)
-test_df.to_csv('outcome_test.csv', index=False)
+train_df.to_csv('datasets/'+log+'/outcome_train.csv', index=False)
+val_df.to_csv('datasets/'+log+'/outcome_val.csv', index=False)
+test_df.to_csv('datasets/'+log+'/outcome_test.csv', index=False)
 
 print("Data splitting completed:")
 print(f"Train set size: {len(train_df)}")
@@ -159,13 +160,13 @@ class OutcomePredictionDataset(Dataset):
 
 
 # Create datasets and DataLoaders
-train_dataset = OutcomePredictionDataset('outcome_train.csv', tokenizer, label_map)
+train_dataset = OutcomePredictionDataset('datasets/'+log+'/outcome_train.csv', tokenizer, label_map)
 train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 
-val_dataset = OutcomePredictionDataset('outcome_val.csv', tokenizer, label_map)
+val_dataset = OutcomePredictionDataset('datasets/'+log+'/outcome_val.csv', tokenizer, label_map)
 val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
-test_dataset = OutcomePredictionDataset('outcome_test.csv', tokenizer, label_map)
+test_dataset = OutcomePredictionDataset('datasets/'+log+'/outcome_test.csv', tokenizer, label_map)
 test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
 # Set up the optimizer and scheduler
@@ -297,19 +298,19 @@ model.save_pretrained('outcome_finetuned_model')
 tokenizer.save_pretrained('outcome_finetuned_model')
 
 # Save the label map
-with open('outcome_finetuned_model/label_map.json', 'w') as f:
+with open('datasets/'+log+'/outcome_finetuned_model/label_map.json', 'w') as f:
     json.dump(label_map, f)
 
 # Example of using the fine-tuned model for inference
 # Load the model and tokenizer
-tokenizer = BertTokenizer.from_pretrained('outcome_finetuned_model')
+tokenizer = BertTokenizer.from_pretrained('datasets/'+log+'/outcome_finetuned_model')
 model = BertForSequenceClassification.from_pretrained(
-    'outcome_finetuned_model'
+    'datasets/'+log+'/outcome_finetuned_model'
 )
 model.to(device)
 
 # Load the label map
-with open('outcome_finetuned_model/label_map.json', 'r') as f:
+with open('datasets/'+log+'/outcome_finetuned_model/label_map.json', 'r') as f:
     label_map = json.load(f)
 id_to_label = {int(idx): outcome for outcome, idx in label_map.items()}
 

@@ -1,5 +1,7 @@
 import pandas as pd
+from sys import argv
 from sklearn.model_selection import train_test_split
+log = argv[1]
 
 
 def preprocess_data_for_mam(input_file, output_prefix_file, output_masked_file):
@@ -31,8 +33,8 @@ def preprocess_data_for_mam(input_file, output_prefix_file, output_masked_file):
 
 
 # Define input and output files
-input_file = "mortgages_processed.csv"  # Processed dataset
-output_prefix_file = "preprocessed_prefixes.csv"  # Output for prefixes and masked activities
+input_file = "datasets/"+log+"/mortgages_processed.csv"  # Processed dataset
+output_prefix_file = "datasets/"+log+"/preprocessed_prefixes.csv"  # Output for prefixes and masked activities
 
 # Run the preprocessing
 preprocess_data_for_mam(input_file, output_prefix_file, None)

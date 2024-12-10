@@ -1,5 +1,4 @@
 import random
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
@@ -8,7 +7,11 @@ import torch.nn as nn
 from transformers import BertTokenizer, BertForMaskedLM
 from torch.optim import AdamW
 from tqdm import tqdm
-import os  # Import os to handle directory paths
+import os
+from sys import argv
+
+log = argv[1]
+
 
 class MaskedActivityDataset(Dataset):
     def __init__(self, data_file, tokenizer, mask_prob=0.15):
@@ -122,7 +125,7 @@ class MaskedActivityDataset(Dataset):
         return masked_activities, labels
 
 # Define paths and tokenizer
-data_file = "preprocessed_prefixes.csv"
+data_file = "datasets/"+log+"/preprocessed_prefixes.csv"
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
 # Create the dataset with random masking
@@ -222,6 +225,5 @@ def setup_training(data_file, batch_size=16, learning_rate=5e-5, num_epochs=3, p
         model.save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
 
-# Define the data file path and start training
-data_file = "preprocessed_prefixes.csv"
+# Start training
 setup_training(data_file, batch_size=16, learning_rate=5e-5, num_epochs=10, save_model=True, save_path='mam_pretrained_model')

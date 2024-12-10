@@ -4,7 +4,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import os
-
+from sys import argv
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     BertTokenizer,
@@ -22,11 +22,12 @@ from tqdm import tqdm
 # Set device (GPU or CPU)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Device:", device)
+log = argv[1]
 
 # Parameters and file paths
-DATA_FILE = 'preprocessed_prefixes.csv'
-MAM_MODEL_PATH = 'mam_pretrained_model'
-FINE_TUNED_MODEL_PATH = 'next_activity_finetuned_model'
+DATA_FILE = 'datasets/'+log+'/preprocessed_prefixes.csv'
+MAM_MODEL_PATH = 'datasets/'+log+'/mam_pretrained_model'
+FINE_TUNED_MODEL_PATH = 'datasets/'+log+'/next_activity_finetuned_model'
 LABEL_MAP_PATH = f'{FINE_TUNED_MODEL_PATH}/label_map.json'
 BATCH_SIZE = 16
 NUM_EPOCHS = 1
