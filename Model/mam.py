@@ -10,6 +10,7 @@ from tqdm import tqdm
 import os
 from sys import argv
 
+
 class MaskedActivityDataset(Dataset):
     def __init__(self, traces, tokenizer, mask_prob=0.15):
         """
@@ -62,7 +63,7 @@ class MaskedActivityDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": labels
         }
-    
+
     def get_max_trace_length(self):
         """Compute the length of the longest trace."""
         return max(len(trace) for trace in self.traces)
@@ -98,7 +99,7 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
 
     for epoch in range(num_epochs):
         total_loss = 0
-        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}")
+        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch + 1}/{num_epochs}")
         optimizer.zero_grad()  # Zero gradients before the accumulation loop
 
         for step, batch in progress_bar:
@@ -119,9 +120,8 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
 
             progress_bar.set_postfix({"loss": total_loss / (progress_bar.n + 1)})
 
-        print(f"Epoch {epoch+1}: Average Loss = {total_loss / len(dataloader)}")
+        print(f"Epoch {epoch + 1}: Average Loss = {total_loss / len(dataloader)}")
 
-
-    print("MAM pretraining complete. Saving model...")
-    model.save_pretrained('datasets/mam_pretrained_model')
-    print("Pretrained model saved.")
+    # print("MAM pretraining complete. Saving model...")
+    # model.save_pretrained('datasets/mam_pretrained_model')
+    # print("Pretrained model saved.")

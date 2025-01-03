@@ -10,7 +10,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device: ', device)
 
 # Load the saved dataset
-pytorch_dataset = torch.load('datasets/' + log + '/pytorch_dataset.pt')
+pytorch_dataset = torch.load('datasets/' + log + '/pytorch_dataset_consistent.pt')
 pretrained_weights = f"datasets/{log}/mam_pretrained_model"
 
 config = Config(pytorch_dataset)
@@ -36,18 +36,21 @@ def evaluate_example(model, dataset, index, device):
     example = dataset[index]
     trace = example['trace'].unsqueeze(0).to(device)  # Add batch dimension
     mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
-    real_next_activity = example['outcome'].item()  # True label for next activity
-    real_outcome = example['customer_type'].item()  # True label for outcome
+    customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
+
+    real_next_activity = example['next_activity'].tolist()  # True labels for next activity
+    real_outcome = example['outcome'].item()  # True label for final outcome
 
     # Make predictions
     with torch.no_grad():
-        next_activity_logits, outcome_logits = model(trace, mask)
-        predicted_next_activity = torch.argmax(next_activity_logits, dim=1).item()
-        predicted_outcome = torch.argmax(outcome_logits, dim=1).item()
+        next_activity_logits, outcome_logits = model(trace, mask, customer_type)
+        predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[0]  # Sequence-level predictions
+        predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
 
     # Print results
     print("Trace:", trace.cpu().tolist())
     print("Attention Mask:", mask.cpu().tolist())
+    print("Customer Type:", customer_type.cpu().tolist())
     print(f"Real Next Activity: {real_next_activity} | Predicted: {predicted_next_activity}")
     print(f"Real Outcome: {real_outcome} | Predicted: {predicted_outcome}")
 
@@ -70,33 +73,36 @@ def evaluate_model(model, dataset, device):
 
     prefix_length_metrics_next_activity = defaultdict(lambda: {"true": [], "pred": []})
     prefix_length_metrics_outcome = defaultdict(lambda: {"true": [], "pred": []})
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             example = dataset[i]
             trace = example['trace'].unsqueeze(0).to(device)  # Add batch dimension
             mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
-            real_next_activity = example['outcome'].item()
-            real_outcome = example['customer_type'].item()
+            customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
+            real_next_activity = example['next_activity'].tolist()
+            real_outcome = example['outcome'].item()
 
-            next_activity_logits, outcome_logits = model(trace, mask)
-            predicted_next_activity = torch.argmax(next_activity_logits, dim=1).item()
-            predicted_outcome = torch.argmax(outcome_logits, dim=1).item()
+            next_activity_logits, outcome_logits = model(trace, mask, customer_type)
+            predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[
+                0]  # Sequence-level predictions
+            predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
 
-            # Collect results
-            all_true_next_activity.append(real_next_activity)
-            all_pred_next_activity.append(predicted_next_activity)
+            # Collect results for next activity prediction (sequence-level comparison)
+            all_true_next_activity.extend(real_next_activity)
+            all_pred_next_activity.extend(predicted_next_activity[:len(real_next_activity)])  # Match sequence lengths
 
+            # Collect results for final outcome prediction (single-label comparison)
             all_true_outcome.append(real_outcome)
             all_pred_outcome.append(predicted_outcome)
 
             # Collect prefix-length-specific metrics
             prefix_length = mask.sum().item()  # Count of non-padded tokens
-            prefix_length_metrics_next_activity[prefix_length]["true"].append(real_next_activity)
-            prefix_length_metrics_next_activity[prefix_length]["pred"].append(predicted_next_activity)
+            prefix_length_metrics_next_activity[prefix_length]["true"].extend(real_next_activity)
+            prefix_length_metrics_next_activity[prefix_length]["pred"].extend(
+                predicted_next_activity[:len(real_next_activity)])
             prefix_length_metrics_outcome[prefix_length]["true"].append(real_outcome)
             prefix_length_metrics_outcome[prefix_length]["pred"].append(predicted_outcome)
-
 
     # Compute overall metrics for next activity prediction
     overall_f1_next_activity = f1_score(all_true_next_activity, all_pred_next_activity, average="macro")
@@ -140,7 +146,6 @@ def evaluate_model(model, dataset, device):
         print(f"  Accuracy: {accuracy:.4f}")
         print(f"  Precision: {precision:.4f}")
         print(f"  Recall: {recall:.4f}")
-
 
     # Display prefix-length-specific metrics for final outcome
     print("\n=== Metrics by Prefix Length (Final Outcome Prediction) ===")

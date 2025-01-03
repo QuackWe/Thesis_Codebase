@@ -27,25 +27,35 @@ def normalize_timestamps(df, column_name, target_format='%Y-%m-%d %H:%M:%S'):
     df[column_name] = df[column_name].apply(convert_to_format)
     unparseable = df[column_name].isnull().sum()
     print(f"Unparseable values after normalization: {unparseable}")
-
     return df
 
 
-if __name__ == "__main__":
-    # Command-line arguments
-    log = argv[1]
-    working_directory = "K:/Klanten/De Volksbank/Thesis Andrei"
-    input_file = f"{working_directory}/Andrei_thesis_KRIF_{log}_vPaul_v2.csv"
+def separate_consistent_traces(df):
+    # Create a mask for consistent cases
+    consistent_mask = ~df['CustomerId'].isin(
+        df.groupby('CustomerId')['outcome']
+        .filter(lambda x: len(x.unique()) > 1)
+        .index
+    )
 
-    # Create the output directory
-    os.makedirs(f"datasets/{log}", exist_ok=True)
+    # Split into consistent and inconsistent datasets
+    consistent_df = df[consistent_mask]
+    inconsistent_df = df[~consistent_mask]
 
-    # Load the input data
-    df = pd.read_csv(input_file, encoding='latin-1')
+    # Print statistics
+    total_cases = df['CustomerId'].nunique()
+    consistent_cases = consistent_df['CustomerId'].nunique()
+    inconsistent_cases = inconsistent_df['CustomerId'].nunique()
 
-    # Normalize timestamps
-    df = normalize_timestamps(df, 'TimestampContact')
+    print(f"Total cases: {total_cases}")
+    print(f"Consistent cases: {consistent_cases}")
+    print(f"Inconsistent cases: {inconsistent_cases}")
+    print(f"Percentage consistent: {(consistent_cases / total_cases) * 100:.2f}%")
 
+    return consistent_df, inconsistent_df
+
+
+def process_traces(df, log_name, is_consistent=True):
     # Combine Topic and Subtopic to create the Activity column
     df['Activity'] = df['topic'].astype(str) + "_" + df['subtopic'].astype(str)
     df = df.sort_values(by=['CustomerId', 'TimestampContact'])
@@ -67,7 +77,10 @@ if __name__ == "__main__":
 
     # Label encode outcomes
     outcome_encoder = LabelEncoder()
-    outcomes['OutcomeID'] = outcome_encoder.fit_transform(outcomes['outcome'])
+    outcomes['OutcomeID'] = outcome_encoder.fit_transform(outcomes['outcome']).astype(int)
+
+    # Create next activity labels by shifting the sequence
+    traces['NextActivityIDs'] = traces['ActivityIDs'].apply(lambda x: x[1:] + [0])  # Shift and pad with 0
 
     # Convert traces to padded sequences
     max_seq_length = max(len(trace) for trace in traces['ActivityIDs'])
@@ -75,6 +88,12 @@ if __name__ == "__main__":
 
     padded_traces = torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(trace[:max_seq_length]) for trace in traces['ActivityIDs']],
+        batch_first=True,
+        padding_value=0
+    )
+
+    padded_next_activities = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(trace[:max_seq_length]) for trace in traces['NextActivityIDs']],
         batch_first=True,
         padding_value=0
     )
@@ -89,16 +108,47 @@ if __name__ == "__main__":
     dataset = pd.DataFrame({
         'CustomerId': traces['CustomerId'],
         'Trace': [trace.tolist() for trace in padded_traces],
+        'NextActivity': [trace.tolist() for trace in padded_next_activities],
         'AttentionMask': attention_masks.tolist(),
         'Outcome': outcomes['OutcomeID'],
         'CustomerType': types['TypeID']
     })
 
-    # print(dataset.head())
-    # print(len(dataset['Trace'][0]))
-    # print(max(len(trace) for trace in dataset['Trace']))
-
     # Create PyTorch Dataset and save it
     torch_dataset = TraceDataset(dataset)
-    torch.save(torch_dataset, f"datasets/{log}/pytorch_dataset.pt")
-    print(f"Processed dataset saved to datasets/{log}/pytorch_dataset.pt")
+    suffix = "consistent" if is_consistent else "inconsistent"
+    save_path = f"datasets/{log_name}/pytorch_dataset_{suffix}.pt"
+    torch.save(torch_dataset, save_path)
+    print(f"Processed dataset saved to {save_path}")
+
+    # Save mappings for later use
+    mappings = {
+        'activity_to_id': activity_to_id,
+        'customer_type_to_id': customer_type_to_id,
+        'outcome_encoder': outcome_encoder
+    }
+    mapping_path = f"datasets/{log_name}/mappings_{suffix}.pt"
+    torch.save(mappings, mapping_path)
+
+
+if __name__ == "__main__":
+    # Command-line arguments
+    log = argv[1]
+    working_directory = "K:/Klanten/De Volksbank/Thesis Andrei"
+    input_file = f"{working_directory}/Andrei_thesis_KRIF_{log}_vPaul_v3.csv"
+
+    # Create the output directory
+    os.makedirs(f"datasets/{log}", exist_ok=True)
+
+    # Load the input data
+    df = pd.read_csv(input_file, encoding='latin-1')
+
+    # Normalize timestamps
+    df = normalize_timestamps(df, 'TimestampContact')
+
+    # Separate consistent and inconsistent traces
+    consistent_df, inconsistent_df = separate_consistent_traces(df)
+
+    # Process both datasets separately
+    process_traces(consistent_df, log, is_consistent=True)
+    process_traces(inconsistent_df, log, is_consistent=False)

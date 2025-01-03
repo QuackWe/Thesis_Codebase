@@ -4,7 +4,6 @@ from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 from torchinfo import summary
-from torchviz import make_dot
 from transformers import BertTokenizer, BertForMaskedLM
 from sys import argv
 import os
@@ -18,7 +17,7 @@ class Config:
         self.max_seq_length = pytorch_dataset.traces.shape[1]  # Second dimension of traces tensor
         self.num_outcomes = pytorch_dataset.outcomes.max().item() + 1  # Assuming outcomes are zero-indexed
         self.embedding_dim = 768  # BERT-base hidden size
-        self.hidden_dim = self.embedding_dim * 2
+        self.hidden_dim = self.embedding_dim
         self.bert_model = "bert-base-uncased"  # Pretrained BERT model
 
 # Main block for training
@@ -26,11 +25,11 @@ if __name__ == "__main__":
     log = argv[1]
 
     # Load the saved dataset
-    pytorch_dataset = torch.load(f'datasets/{log}/pytorch_dataset.pt')
+    pytorch_dataset = torch.load(f'datasets/{log}/pytorch_dataset_consistent.pt')
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print('Device: ', device)
-    
+
     # Check if MAM is already pretrained
     pretrained_weights = f"datasets/{log}/mam_pretrained_model"
     if not os.path.exists(pretrained_weights):
@@ -51,9 +50,10 @@ if __name__ == "__main__":
         # Save the pretrained model
         mam_model.save_pretrained(pretrained_weights)
         print(f"MAM pretraining complete. Model saved to '{pretrained_weights}'")
-    else: 
+    else:
         print("MAM already pretrained. Skipping MAM pretraining.")
-    # Create configuration
+
+    # Create configuration for fine-tuning
     config = Config(pytorch_dataset)
 
     # Create DataLoader for fine-tuning
@@ -62,31 +62,26 @@ if __name__ == "__main__":
     # Initialize Multitask Model with pretrained weights
     multitask_model = MultitaskBERTModel(config, pretrained_weights=pretrained_weights).to(device)
     optimizer = torch.optim.Adam(multitask_model.parameters(), lr=1e-4)
-    loss_fn = nn.CrossEntropyLoss()
 
-
-    # Generate a sample input for the model
+    # Generate a sample input for summary visualization (optional)
     sample_input = torch.randint(0, config.num_activities, (1, config.max_seq_length)).to(device)
     sample_attention_mask = torch.ones_like(sample_input).to(device)
 
-    summary(
-    multitask_model,
-    input_data=(sample_input, sample_attention_mask),
-    col_names=["input_size", "output_size", "num_params", "trainable"],
-    device=device
-    )
-
-    # Perform a forward pass to get the computation graph
-    outputs = multitask_model(sample_input, sample_attention_mask)
-
-    # Generate a visualization of the model's computation graph
-    dot = make_dot(outputs, params=dict(multitask_model.named_parameters()))
-    # dot.render("model_architecture", format="png")  # Save as PNG, not working on tue server
+    try:
+        summary(
+            multitask_model,
+            input_data=(sample_input, sample_attention_mask),
+            col_names=["input_size", "output_size", "num_params", "trainable"],
+            device=device,
+        )
+    except Exception as e:
+        print(f"Summary generation failed: {e}")
 
     # Fine-tune the Multitask Model
     print("Starting multitask fine-tuning...")
-    train_model(multitask_model, dataloader, optimizer, loss_fn, device, num_epochs=1)
+    train_model(multitask_model, dataloader, optimizer, device, config, num_epochs=10)
 
     # Save the fine-tuned model
-    torch.save(multitask_model.state_dict(), f'datasets/{log}/multitask_bert_model.pth')
-    print(f"Fine-tuned multitask model saved to 'datasets/{log}/multitask_bert_model.pth'")
+    save_path = f'datasets/{log}/multitask_bert_model.pth'
+    torch.save(multitask_model.state_dict(), save_path)
+    print(f"Fine-tuned multitask model saved to '{save_path}'")
