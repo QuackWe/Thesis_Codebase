@@ -9,6 +9,7 @@ from sys import argv
 import os
 from mam import train_mam, MaskedActivityDataset  # Import the MAM training function
 
+
 # Configuration setup
 class Config:
     def __init__(self, pytorch_dataset):
@@ -17,6 +18,7 @@ class Config:
         self.max_seq_length = pytorch_dataset.traces.shape[1]  # Second dimension of traces tensor
         self.num_outcomes = pytorch_dataset.outcomes.max().item() + 1  # Assuming outcomes are zero-indexed
         self.embedding_dim = 768  # BERT-base hidden size
+        self.time_embedding_dim = self.embedding_dim  # Use same dimension as activities
         self.hidden_dim = self.embedding_dim
         self.bert_model = "bert-base-uncased"  # Pretrained BERT model
         self.num_heads = 12  # Standard number of attention heads in BERT-base
@@ -24,7 +26,8 @@ class Config:
         self.e_prompt_length = 10
         self.prompt_prefix_size = 5
         self.prefix_tune = True
-        
+
+
 # Main block for training
 if __name__ == "__main__":
     log = argv[1]
@@ -42,8 +45,10 @@ if __name__ == "__main__":
         print("Starting MAM pretraining...")
         tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         traces = [trace.tolist() for trace in pytorch_dataset.traces]  # Extract traces
+        times = [time.tolist() for time in pytorch_dataset.times]  # Extract times
 
-        mam_dataset = MaskedActivityDataset(traces, tokenizer)
+        # Create MAM dataset with temporal features
+        mam_dataset = MaskedActivityDataset(traces, times, tokenizer)
         mam_dataloader = DataLoader(mam_dataset, batch_size=16, shuffle=True)
 
         mam_model = BertForMaskedLM.from_pretrained("bert-base-uncased")  # Initialize BERT for MAM
@@ -62,25 +67,11 @@ if __name__ == "__main__":
     config = Config(pytorch_dataset)
 
     # Create DataLoader for fine-tuning
-    dataloader = DataLoader(pytorch_dataset, batch_size=16, shuffle=True)  # Adjust batch size as needed
+    dataloader = DataLoader(pytorch_dataset, batch_size=8, shuffle=True)  # Adjust batch size as needed
 
     # Initialize Multitask Model with pretrained weights
     multitask_model = MultitaskBERTModel(config, pretrained_weights=pretrained_weights).to(device)
     optimizer = torch.optim.Adam(multitask_model.parameters(), lr=1e-4)
-
-    # Generate a sample input for summary visualization (optional)
-    sample_input = torch.randint(0, config.num_activities, (1, config.max_seq_length)).to(device)
-    sample_attention_mask = torch.ones_like(sample_input).to(device)
-
-    try:
-        summary(
-            multitask_model,
-            input_data=(sample_input, sample_attention_mask),
-            col_names=["input_size", "output_size", "num_params", "trainable"],
-            device=device,
-        )
-    except Exception as e:
-        print(f"Summary generation failed: {e}")
 
     # Fine-tune the Multitask Model
     print("Starting multitask fine-tuning...")

@@ -39,8 +39,8 @@ def separate_consistent_traces(df):
     )
 
     # Split into consistent and inconsistent datasets
-    consistent_df = df[consistent_mask]
-    inconsistent_df = df[~consistent_mask]
+    consistent_df = df[consistent_mask].copy()
+    inconsistent_df = df[~consistent_mask].copy()
 
     # Print statistics
     total_cases = df['CustomerId'].nunique()
@@ -54,16 +54,55 @@ def separate_consistent_traces(df):
 
     return consistent_df, inconsistent_df
 
+def robust_scale(series, eps=1e-8):
+    q75 = series.quantile(0.75)
+    q25 = series.quantile(0.25)
+    denom = (q75 - q25)
+    if abs(denom) < eps:
+        denom = eps
+    return (series - series.median()) / denom
 
 def process_traces(df, log_name, is_consistent=True):
     # Combine Topic and Subtopic to create the Activity column
     df['Activity'] = df['topic'].astype(str) + "_" + df['subtopic'].astype(str)
+
+    # Add relative time calculation with explicit format
+    df['RelativeTime'] = df.groupby('CustomerId')['TimestampContact'].transform(
+        lambda x: (pd.to_datetime(x, format='%Y-%m-%d %H:%M:%S') -
+                   pd.to_datetime(x.iloc[0], format='%Y-%m-%d %H:%M:%S')).dt.total_seconds() / 3600 # Converted to hours
+    )
+
+    # Add debug prints here
+    print("\nInitial RelativeTime stats:")
+    print(df['RelativeTime'].describe())
+    print("NaN in RelativeTime:", df['RelativeTime'].isnull().sum())
+
+    # Log transform
+    df['LogTime'] = np.log1p(df['RelativeTime'])
+    print("\nLogTime stats:")
+    print(df['LogTime'].describe())
+    print("NaN in LogTime:", df['LogTime'].isnull().sum())
+
+    # Normalize relative times to [0,1] range within each trace
+    # 1. Log transform to handle wide time ranges
+    df['LogTime'] = np.log1p(df['RelativeTime'])
+    # 2. Robust standardization per customer
+    df['NormalizedTime'] = df.groupby('CustomerId')['LogTime'].transform(robust_scale)
+    df['NormalizedTime'] = df['NormalizedTime'].clip(-5, 5)
+
+    # 3. Handle outliers
+    # df['NormalizedTime'] = df['NormalizedTime'].clip(-5, 5)
+    num_nans = df['NormalizedTime'].isnull().sum()
+    if num_nans > 0:
+        print(f"Warning: {num_nans} NaN values remain after robust scaling and clipping.")
+
     df = df.sort_values(by=['CustomerId', 'TimestampContact'])
 
     # Group by CustomerId to create traces
     traces = df.groupby('CustomerId')['Activity'].apply(list).reset_index()
     outcomes = df.groupby('CustomerId')['outcome'].first().reset_index()
     types = df.groupby('CustomerId')['type_of_customer'].first().reset_index()
+    times = df.groupby('CustomerId')['NormalizedTime'].apply(list).reset_index()
 
     # Create activity-to-ID mapping
     unique_activities = df['Activity'].unique()
@@ -98,6 +137,12 @@ def process_traces(df, log_name, is_consistent=True):
         padding_value=0
     )
 
+    padded_times = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(time[:max_seq_length], dtype=torch.float) for time in times['NormalizedTime']],
+        batch_first=True,
+        padding_value=0.0
+    )
+
     # Create attention masks
     attention_masks = torch.tensor([
         [1] * len(trace[:max_seq_length]) + [0] * (max_seq_length - len(trace))
@@ -108,6 +153,7 @@ def process_traces(df, log_name, is_consistent=True):
     dataset = pd.DataFrame({
         'CustomerId': traces['CustomerId'],
         'Trace': [trace.tolist() for trace in padded_traces],
+        'Times': [time.tolist() for time in padded_times],
         'NextActivity': [trace.tolist() for trace in padded_next_activities],
         'AttentionMask': attention_masks.tolist(),
         'Outcome': outcomes['OutcomeID'],

@@ -40,6 +40,7 @@ def evaluate_example(model, dataset, index, device):
     # Get the sample from the dataset
     example = dataset[index]
     trace = example['trace'].unsqueeze(0).to(device)  # Add batch dimension
+    times = example['times'].unsqueeze(0).to(device)  # shape [1, seq_len]
     mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
     customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
 
@@ -48,13 +49,12 @@ def evaluate_example(model, dataset, index, device):
     assert mask.size(1) == trace.size(1), "Mask does not match trace length"
     assert customer_type.size(0) == trace.size(0), "Customer type batch size mismatch"
 
-
     real_next_activity = example['next_activity'].tolist()  # True labels for next activity
     real_outcome = example['outcome'].item()  # True label for final outcome
 
     # Make predictions
     with torch.no_grad():
-        next_activity_logits, outcome_logits = model(trace, mask, customer_type)
+        next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
         predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[0]  # Sequence-level predictions
         predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
 
@@ -64,6 +64,7 @@ def evaluate_example(model, dataset, index, device):
     print("Customer Type:", customer_type.cpu().tolist())
     print(f"| Real Next Activity: \n{real_next_activity} \n| Predicted: \n{predicted_next_activity}")
     print(f"Real Outcome: {real_outcome} | Predicted: {predicted_outcome}")
+
 
 def analyze_concept_mapping(model):
     """Analyze the mapping between customer types and concept IDs"""
@@ -81,7 +82,7 @@ def visualize_prompts(model, num_examples=2):
 
     # G-Prompt example
     if hasattr(model.prompted_bert, 'g_prompt'):
-        g_key, g_value = model.prompted_bert.g_prompt.get_g_prompt(batch_size = 1)
+        g_key, g_value = model.prompted_bert.g_prompt.get_g_prompt(batch_size=1)
         print("\nG-Prompt (Global) Example:")
         print(f"Shape: {g_key.shape}")
         print(f"First few values: {g_key[0, 0, 0, :3, :3]}")  # First 3x3 values
@@ -95,16 +96,14 @@ def visualize_prompts(model, num_examples=2):
         for i, (customer_type, concept_id) in enumerate(sorted(concept_mapping.items())):
             if i >= num_examples:
                 break
-                
+
             # Create a batch tensor with single customer type
             ctype_tensor = torch.tensor([float(customer_type)], device=device)
             e_prompt = model.prompted_bert.e_prompt.get_e_prompt(ctype_tensor)
-            
+
             print(f"\nCustomer Type {customer_type} (Concept {concept_id}):")
             print(f"Shape: {e_prompt.shape}")
             print(f"First few values: {e_prompt[0, 0, 0, :3, :3]}")  # First 3x3 values
-
-
 
 
 def evaluate_per_concept(model, dataset, device):
@@ -114,17 +113,18 @@ def evaluate_per_concept(model, dataset, device):
         'next_activity': {'true': [], 'pred': []},
         'outcome': {'true': [], 'pred': []}
     })
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             example = dataset[i]
             trace = example['trace'].unsqueeze(0).to(device)
             mask = example['mask'].unsqueeze(0).to(device)
+            times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)
-            
+
             # Get predictions
-            next_activity_logits, outcome_logits = model(trace, mask, customer_type)
-            
+            next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
+
             # Store predictions by concept
             c_type = customer_type.item()
             concept_metrics[c_type]['next_activity']['true'].extend(example['next_activity'].tolist())
@@ -135,26 +135,27 @@ def evaluate_per_concept(model, dataset, device):
             concept_metrics[c_type]['outcome']['pred'].append(
                 torch.argmax(outcome_logits, dim=1).item()
             )
-    
+
     # Compute metrics per concept
     results = {}
     for c_type, metrics in concept_metrics.items():
         results[c_type] = {
             'next_activity': {
-                'f1': f1_score(metrics['next_activity']['true'], 
-                             metrics['next_activity']['pred'], average='macro'),
-                'accuracy': accuracy_score(metrics['next_activity']['true'], 
-                                        metrics['next_activity']['pred'])
+                'f1': f1_score(metrics['next_activity']['true'],
+                               metrics['next_activity']['pred'], average='macro'),
+                'accuracy': accuracy_score(metrics['next_activity']['true'],
+                                           metrics['next_activity']['pred'])
             },
             'outcome': {
-                'f1': f1_score(metrics['outcome']['true'], 
-                             metrics['outcome']['pred'], average='macro'),
-                'accuracy': accuracy_score(metrics['outcome']['true'], 
-                                        metrics['outcome']['pred'])
+                'f1': f1_score(metrics['outcome']['true'],
+                               metrics['outcome']['pred'], average='macro'),
+                'accuracy': accuracy_score(metrics['outcome']['true'],
+                                           metrics['outcome']['pred'])
             }
         }
-    
+
     return results
+
 
 def analyze_concept_drift(model, dataset, device):
     """Analyze how the model adapts to different customer types."""
@@ -163,10 +164,10 @@ def analyze_concept_drift(model, dataset, device):
     print("\n=== Concept Drift Analysis ===")
     print(f"Number of discovered concepts: {len(concept_mapping)}")
     print("Customer Type to Concept ID mapping:", concept_mapping)
-    
+
     # Evaluate per concept
     concept_results = evaluate_per_concept(model, dataset, device)
-    
+
     print("\n=== Performance by Customer Type ===")
     for c_type, metrics in concept_results.items():
         print(f"\nCustomer Type {c_type}:")
@@ -176,6 +177,7 @@ def analyze_concept_drift(model, dataset, device):
         print("Outcome Prediction:")
         print(f"  F1 Score: {metrics['outcome']['f1']:.4f}")
         print(f"  Accuracy: {metrics['outcome']['accuracy']:.4f}")
+
 
 def evaluate_model(model, dataset, device):
     """
@@ -195,19 +197,20 @@ def evaluate_model(model, dataset, device):
 
     prefix_length_metrics_next_activity = defaultdict(lambda: {"true": [], "pred": []})
     prefix_length_metrics_outcome = defaultdict(lambda: {"true": [], "pred": []})
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             example = dataset[i]
             trace = example['trace'].unsqueeze(0).to(device)  # Add batch dimension
             mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
+            times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
             real_next_activity = example['next_activity'].tolist()
             real_outcome = example['outcome'].item()
 
-
-            next_activity_logits, outcome_logits = model(trace, mask, customer_type)
-            predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[0]  # Sequence-level predictions
+            next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
+            predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[
+                0]  # Sequence-level predictions
             predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
 
             # Collect results for next activity prediction (sequence-level comparison)
@@ -221,10 +224,10 @@ def evaluate_model(model, dataset, device):
             # Collect prefix-length-specific metrics
             prefix_length = mask.sum().item()  # Count of non-padded tokens
             prefix_length_metrics_next_activity[prefix_length]["true"].extend(real_next_activity)
-            prefix_length_metrics_next_activity[prefix_length]["pred"].extend(predicted_next_activity[:len(real_next_activity)])
+            prefix_length_metrics_next_activity[prefix_length]["pred"].extend(
+                predicted_next_activity[:len(real_next_activity)])
             prefix_length_metrics_outcome[prefix_length]["true"].append(real_outcome)
             prefix_length_metrics_outcome[prefix_length]["pred"].append(predicted_outcome)
-
 
     # Compute overall metrics for next activity prediction
     overall_f1_next_activity = f1_score(all_true_next_activity, all_pred_next_activity, average="macro")
@@ -269,7 +272,6 @@ def evaluate_model(model, dataset, device):
         print(f"  Precision: {precision:.4f}")
         print(f"  Recall: {recall:.4f}")
 
-
     # Display prefix-length-specific metrics for final outcome
     print("\n=== Metrics by Prefix Length (Final Outcome Prediction) ===")
     for prefix_length, metrics in sorted(prefix_length_metrics_outcome.items()):
@@ -296,7 +298,6 @@ analyze_concept_mapping(model)
 
 # Prompt visualization
 visualize_prompts(model)
-
 
 # Concept drift analysis
 analyze_concept_drift(model, pytorch_dataset, device)

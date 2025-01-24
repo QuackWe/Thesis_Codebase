@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import BertModel
 from tqdm import tqdm
 import numpy as np
@@ -19,6 +18,18 @@ class MultitaskBERTModel(nn.Module):
                 layer_num = int(name.split("encoder.layer.")[1].split(".")[0])
                 if layer_num < 6:
                     param.requires_grad = False
+
+        # Improved time embedding layer
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        # Initialize time embedding weights properly
+        with torch.no_grad():
+            self.time_embedding[0].weight.data.uniform_(-0.1, 0.1)
+            self.time_embedding[0].bias.data.zero_()
 
         self.dropout = nn.Dropout(p=0.1)
         self.shared_hidden = nn.Linear(config.embedding_dim, config.embedding_dim)
@@ -45,19 +56,19 @@ class MultitaskBERTModel(nn.Module):
             config,
             pretrained_weights=pretrained_weights,
             enable_g_prompt=True,  # Enable/disable G-Prompts here for ablation studies
-            enable_e_prompt=True   # Enable/disable E-Prompts here for ablation studies
+            enable_e_prompt=True  # Enable/disable E-Prompts here for ablation studies
         )
 
         if torch.cuda.is_available():
             self.prompted_bert = self.prompted_bert.to(torch.cuda.current_device())
 
-
-    def forward(self, input_ids, attention_mask, customer_type=None):
+    def forward(self, input_ids, attention_mask, times, customer_type=None):
         """
         Args:
             input_ids:       [batch_size, seq_len]        Token/Activity IDs
             attention_mask:  [batch_size, seq_len]        1=valid token, 0=padding
             customer_type:   [batch_size] or None         For concept drift adaptation
+            times:           [batch_size, seq_len]        Normalized time values
 
         Returns:
             next_activity_logits: [batch_size, seq_len, config.num_activities]
@@ -66,23 +77,57 @@ class MultitaskBERTModel(nn.Module):
 
         # 1) Use PromptedBertModel to inject G/E-Prompts inside the self-attention layers
         #    This returns last_hidden_state of shape [batch_size, seq_len, hidden_dim]
+
+        # Validate time inputs
+        if torch.isnan(times).any():
+            raise ValueError(f"Found {torch.isnan(times).sum().item()} NaN values in input times")
+        if torch.isinf(times).any():
+            raise ValueError(f"Found {torch.isinf(times).sum().item()} Inf values in input times")
+        # Ensure times have the correct shape
+        if times.dim() != 2:
+            raise ValueError(f"Expected times tensor to have 2 dimensions, got {times.dim()}")
+
+        # Memory optimization
+        torch.cuda.empty_cache()
+
+        # Create time mask that considers both padding (attention_mask) and valid times
+        time_mask = attention_mask.unsqueeze(-1).float()
+        time_mask = time_mask * (~torch.isnan(times)).float().unsqueeze(-1)
+
+        # Keep original times but mask NaN positions
+        times_clean = times.clone().unsqueeze(-1)
+
+        # Get time embeddings with proper masking
+        time_embeddings = self.time_embedding(times_clean)
+
+        # Apply mask to zero out invalid positions while preserving gradient paths
+        time_embeddings = time_embeddings * time_mask.expand_as(time_embeddings)
+
+        # Forward through prompted BERT
         last_hidden_state = self.prompted_bert(
             input_ids,
             attention_mask=attention_mask,
-            customer_type=customer_type  # shape [batch_size], might be 0,1,2 per sample
+            times=times,
+            customer_type=customer_type
         )
 
         # 2) Next-Activity Prediction (per-step)
-        seq_output = self.dropout(last_hidden_state)  
+        seq_output = self.dropout(last_hidden_state)
         next_activity_logits = self.next_activity_head(seq_output)
         # Shape => [batch_size, seq_len, num_activities]
+
+        # Modify next activity logits to force padding predictions to be padding
+        padding_mask = (input_ids == 0).unsqueeze(-1).expand_as(next_activity_logits)
+        next_activity_logits = next_activity_logits.masked_fill(padding_mask, float('-inf'))
+        # Force the padding token (0) logits to be high where padding exists
+        next_activity_logits[:, :, 0] = next_activity_logits[:, :, 0].masked_fill(padding_mask[:, :, 0], float('inf'))
 
         # 3) Outcome Prediction (single label per sequence)
         #    Average pooling across valid tokens, determined by attention_mask
         mask_expanded = attention_mask.unsqueeze(-1).expand_as(last_hidden_state).float()
-        sum_embeddings = (last_hidden_state * mask_expanded).sum(dim=1)   # [batch_size, hidden_dim]
-        sum_mask = mask_expanded.sum(dim=1).clamp_min(1e-9)               # [batch_size, hidden_dim]
-        pooled_output = sum_embeddings / sum_mask                         # [batch_size, hidden_dim]
+        sum_embeddings = (last_hidden_state * mask_expanded).sum(dim=1)  # [batch_size, hidden_dim]
+        sum_mask = mask_expanded.sum(dim=1).clamp_min(1e-9)  # [batch_size, hidden_dim]
+        pooled_output = sum_embeddings / sum_mask  # [batch_size, hidden_dim]
 
         pooled_output = self.shared_hidden(pooled_output)
         pooled_output = self.shared_activation(pooled_output)
@@ -119,7 +164,29 @@ def compute_class_weights(dataloader, device, num_activities, num_outcomes):
     return activity_weights.to(device), outcome_weights.to(device)
 
 
-def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=False, accumulation_steps=2):
+class DynamicWeightedLoss:
+    def __init__(self, num_tasks=2):
+        self.prev_losses = [1.0] * num_tasks
+        self.weights = [0.5] * num_tasks
+
+    def update(self, current_losses):
+        # Compute relative improvement
+        improvements = [prev / curr if curr > 0 else 1.0
+                        for prev, curr in zip(self.prev_losses, current_losses)]
+        total_imp = sum(improvements)
+
+        # Update weights - give more weight to tasks that improve less
+        self.weights = [imp / total_imp for imp in improvements]
+        self.prev_losses = current_losses
+        return self.weights
+
+
+# In train_model():
+loss_weighter = DynamicWeightedLoss()
+
+
+def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=False,
+                accumulation_steps=4):
     """
     Fine-tune the multitask model with class weights for outcome prediction.
     Args:
@@ -137,7 +204,8 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
     # We'll create a temporary dataloader iteration to gather frequencies.
     # IMPORTANT: Ensure that this does not disrupt your main training. If needed, recreate dataloader or cache data.
     model = model.to(device)
-    activity_weights, outcome_weights = compute_class_weights(dataloader, device, config.num_activities, config.num_outcomes)
+    activity_weights, outcome_weights = compute_class_weights(dataloader, device, config.num_activities,
+                                                              config.num_outcomes)
 
     # Separate loss functions for each task with computed weights
     next_activity_loss_fn = nn.CrossEntropyLoss(weight=activity_weights)
@@ -145,20 +213,20 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
 
     model.train()
 
-     # Compute class weights only for outcome prediction task
+    # Compute class weights only for outcome prediction task
     outcome_labels = []
     for batch in dataloader:
         outcome_labels.extend(batch['outcome'].numpy())
-    
+
     # Calculate class weights for outcome prediction
     outcome_classes = np.unique(outcome_labels)
-    outcome_weights = compute_class_weight('balanced', 
-                                         classes=outcome_classes, 
-                                         y=outcome_labels)
-    
+    outcome_weights = compute_class_weight('balanced',
+                                           classes=outcome_classes,
+                                           y=outcome_labels)
+
     # Convert weights to PyTorch tensor
     outcome_weights = torch.tensor(outcome_weights, dtype=torch.float).to(device)
-    
+
     # Create loss functions:
     # Standard CE for next activity prediction
     next_activity_loss_fn = nn.CrossEntropyLoss().to(device)
@@ -171,30 +239,36 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
         total_loss = 0
         next_activity_total_loss = 0
         outcome_total_loss = 0
-        
-        print(f"Starting epoch {epoch+1}/{num_epochs}...")
-        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), 
-                          desc=f"Epoch {epoch+1}/{num_epochs}")
+
+        print(f"Starting epoch {epoch + 1}/{num_epochs}...")
+        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader),
+                            desc=f"Epoch {epoch + 1}/{num_epochs}")
 
         optimizer.zero_grad()
-
         for step, batch in progress_bar:
+
+            # Validate batch data
+            if torch.isnan(batch['times']).any():
+                raise ValueError(f"NaN values found in batch times: {torch.isnan(batch['times']).sum().item()}")
+
             input_ids = batch['trace'].to(device)
             attention_mask = batch['mask'].to(device)
             customer_types = batch['customer_type'].to(device)
+            times = batch['times'].to(device)
             next_activity_labels = batch['next_activity'].to(device)
             outcome_labels = batch['outcome'].to(device)
-            
+
             if print_batch_data and epoch == 0 and step == 0:
                 print("=== First Batch Data ===")
                 print("Input IDs (trace):", input_ids)
+                print("Relative Time:", times)
                 print("Attention Mask:", attention_mask)
                 print("Customer Types:", customer_types)
                 print("Outcome Labels:", outcome_labels)
                 print("========================")
 
             # Forward pass
-            next_activity_logits, outcome_logits = model(input_ids, attention_mask, customer_types)
+            next_activity_logits, outcome_logits = model(input_ids, attention_mask, times, customer_types)
 
             # --- Next Activity Loss ---
             # Flatten (batch_size * seq_len) to align with cross-entropy:
@@ -203,25 +277,35 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
 
             # We only want valid positions (not padded). Flatten the attention_mask:
             valid_mask = attention_mask.view(-1).bool()
-            valid_activity_logits = next_activity_logits_2d[valid_mask]
-            valid_activity_labels = next_activity_labels_1d[valid_mask]
+            # Add padding mask
+            padding_mask = (input_ids != 0).view(-1).bool()
+            # Combine masks to only consider non-padding valid positions
+            final_mask = valid_mask & padding_mask
+
+            valid_activity_logits = next_activity_logits_2d[final_mask]
+            valid_activity_labels = next_activity_labels_1d[final_mask]
 
             next_activity_loss = next_activity_loss_fn(valid_activity_logits, valid_activity_labels)
 
             # --- Outcome Loss ---
-            # One outcome per sequence, so no flattening. 
+            # One outcome per sequence, so no flattening.
             # outcome_logits: [batch_size, num_outcomes], outcome_labels: [batch_size]
             outcome_loss = outcome_loss_fn(outcome_logits, outcome_labels)
-            
-            # Combine losses with task weights
-            # You might want to adjust these weights based on task importance
-            task1_weight = 0.7  # Next activity prediction
-            task2_weight = 0.3  # Outcome prediction
-            loss = (task1_weight * next_activity_loss + 
-                   task2_weight * outcome_loss) / accumulation_steps
+
+            # Get dynamic weights based on current losses
+            task_weights = loss_weighter.update([next_activity_loss.item(),
+                                                 outcome_loss.item()])
+
+            # Combined loss with dynamic weights
+            loss = (task_weights[0] * next_activity_loss +
+                    task_weights[1] * outcome_loss) / accumulation_steps
 
             # Backward pass
             loss.backward()
+
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             if (step + 1) % accumulation_steps == 0 or (step + 1) == len(dataloader):
                 optimizer.step()
                 optimizer.zero_grad()
@@ -242,8 +326,8 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
         avg_loss = total_loss / len(dataloader)
         avg_next_activity_loss = next_activity_total_loss / len(dataloader)
         avg_outcome_loss = outcome_total_loss / len(dataloader)
-        
-        print(f"Epoch {epoch+1}/{num_epochs} completed:")
+
+        print(f"Epoch {epoch + 1}/{num_epochs} completed:")
         print(f"Average Total Loss: {avg_loss:.4f}")
         print(f"Average Next Activity Loss: {avg_next_activity_loss:.4f}")
         print(f"Average Outcome Loss: {avg_outcome_loss:.4f}")

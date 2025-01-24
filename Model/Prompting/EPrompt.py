@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class E_Prompt(nn.Module):
     def __init__(self, num_heads, input_size, prompt_key_init, layers, prompt_init, length, prompt_prefix_size, prefix):
         super(E_Prompt, self).__init__()
@@ -10,12 +11,12 @@ class E_Prompt(nn.Module):
         self.size = length
         self.prompt_prefix_size = prompt_prefix_size
         self.prefix_tune = prefix
-        
-        self.prompt_key_init = prompt_key_init  
+
+        self.prompt_key_init = prompt_key_init
         self.layers = layers  # keep for consistency
 
         self.task_storage = nn.ParameterDict()  # concept_id -> prompt
-        self.concept_mapping = {}               # str(customer_type) -> str(concept_id)
+        self.concept_mapping = {}  # str(customer_type) -> str(concept_id)
         self.next_concept_id = 1
 
     def init_e_prompt(self, concept_id):
@@ -29,7 +30,7 @@ class E_Prompt(nn.Module):
         else:  # 'uniform'
             prompt = nn.Parameter(torch.randn(prompt_shape))
             nn.init.uniform_(prompt, -1, 1)
-        
+
         self.task_storage[str(concept_id)] = prompt
 
     def get_or_create_concept_id(self, ctype_scalar):
@@ -50,7 +51,7 @@ class E_Prompt(nn.Module):
         """
         customer_type_batch: shape [batch_size] (tensor)
         Return shape => [batch_size, dup, 1, num_heads, prompt_length, head_dim]
-        
+
         Each sample i in the batch gets its own concept's 5D prompt.
         """
         if not isinstance(customer_type_batch, torch.Tensor):
@@ -58,7 +59,7 @@ class E_Prompt(nn.Module):
 
         device = customer_type_batch.device
         batch_size = customer_type_batch.size(0)
-        
+
         # If we haven't created any concept yet, forcibly create one for the first sample
         if len(self.task_storage) == 0:
             first_ctype = int(customer_type_batch[0].item())
@@ -94,11 +95,11 @@ class E_Prompt(nn.Module):
 
     def load_prompts(self, save_path):
         checkpoint = torch.load(f"{save_path}/eprompts.pt")
-        
+
         # Reconstruct task_storage from saved state
         self.task_storage = nn.ParameterDict()
         for key, tensor in checkpoint['task_storage_state'].items():
             self.task_storage[key] = nn.Parameter(tensor)
-        
+
         self.concept_mapping = checkpoint['concept_mapping']
         self.next_concept_id = checkpoint['next_concept_id']

@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 import math
 
+
 class PromptedBertLayer(BertLayer):
     """
     Subclass of BertLayer that prepends G-Prompt and E-Prompt to the key/value
     tensors inside the self-attention mechanism.
     """
+
     def __init__(self, config):
         super().__init__(config)
         self.attention = PromptedBertAttention(config)
@@ -18,15 +20,15 @@ class PromptedBertLayer(BertLayer):
         # We do NOT define G_Prompt/E_Prompt here because we’ll get them from the parent model.
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        g_key_prefix=None,
-        g_value_prefix=None,
-        e_key_prefix=None,
-        e_value_prefix=None,
-        *args,
-        **kwargs
+            self,
+            hidden_states,
+            attention_mask=None,
+            g_key_prefix=None,
+            g_value_prefix=None,
+            e_key_prefix=None,
+            e_value_prefix=None,
+            *args,
+            **kwargs
     ):
         """
         The main difference from the standard BertLayer forward is that we
@@ -56,20 +58,21 @@ class PromptedBertEncoder(BertEncoder):
     """
     Subclass of BertEncoder that passes the G-Prompt and E-Prompt down into each BertLayer.
     """
+
     def __init__(self, config):
         super().__init__(config)
         self.layer = nn.ModuleList([PromptedBertLayer(config) for _ in range(config.num_hidden_layers)])
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        g_key_prefix=None,
-        g_value_prefix=None,
-        e_key_prefix=None,
-        e_value_prefix=None,
-        *args,
-        **kwargs
+            self,
+            hidden_states,
+            attention_mask=None,
+            g_key_prefix=None,
+            g_value_prefix=None,
+            e_key_prefix=None,
+            e_value_prefix=None,
+            *args,
+            **kwargs
     ):
         for i, layer_module in enumerate(self.layer):
             layer_outputs = layer_module(
@@ -90,6 +93,7 @@ class PromptedBertModel(nn.Module):
     """
     A BERT backbone that injects G-Prompt and E-Prompt inside each encoder layer.
     """
+
     def __init__(self, config, pretrained_weights=None, enable_g_prompt=True, enable_e_prompt=True):
         super().__init__()
 
@@ -100,6 +104,18 @@ class PromptedBertModel(nn.Module):
         # Build a custom encoder that inherits from the standard BertEncoder
         self.encoder = PromptedBertEncoder(bert_config)
 
+        # Improved time embedding layer
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        # Initialize time embedding weights properly
+        with torch.no_grad():
+            self.time_embedding[0].weight.data.uniform_(-0.1, 0.1)
+            self.time_embedding[0].bias.data.zero_()
+
         # Tie or freeze layers if desired:
         # Freeze the first half of layers
         huggingface_bert = BertModel.from_pretrained(pretrained_weights)
@@ -108,11 +124,11 @@ class PromptedBertModel(nn.Module):
                 layer_num = int(name.split("layer.")[1].split(".")[0])
                 if layer_num < bert_config.num_hidden_layers // 2:
                     param.requires_grad = False
-        
+
         # Copy the weights from the huggingface_bert encoder
         for i, layer in enumerate(self.encoder.layer):
             layer.load_state_dict(huggingface_bert.encoder.layer[i].state_dict())
-        
+
         # Initialize G-Prompt if enabled
         self.enable_g_prompt = enable_g_prompt
         if enable_g_prompt:
@@ -144,9 +160,29 @@ class PromptedBertModel(nn.Module):
         if torch.cuda.is_available():
             self.to(torch.cuda.current_device())
 
-    def forward(self, input_ids, attention_mask, customer_type=None):
+    def forward(self, input_ids, attention_mask, times, customer_type=None):
+        """
+        Args:
+            input_ids: [batch_size, seq_len] Token/Activity IDs
+            attention_mask: [batch_size, seq_len] 1=valid token, 0=padding
+            times: [batch_size, seq_len] Normalized time values
+            customer_type: [batch_size] or None For concept drift adaptation
+        """
         batch_size, seq_len = input_ids.shape
+
+        # Get BERT embeddings
         hidden_states = self.embeddings(input_ids=input_ids)
+
+        # Ensure times have the correct shape
+        if times.dim() == 2:
+            times = times.unsqueeze(-1)  # Add a dimension to make it [batch_size, seq_len, 1]
+        elif times.dim() != 3:
+            raise ValueError(f"Expected times tensor to have 2 or 3 dimensions, got {times.dim()}")
+
+        # Create time embeddings and add to hidden states
+        time_embeddings = self.time_embedding(times)
+
+        hidden_states = hidden_states + time_embeddings  # Add this line
 
         # G-Prompt
         g_key_prefix, g_value_prefix = None, None
@@ -174,21 +210,20 @@ class PromptedBertModel(nn.Module):
         return last_hidden_state
 
 
-
 class PromptedBertSelfAttention(BertSelfAttention):
     def __init__(self, config):
         super().__init__(config)
         self.num_heads = config.num_attention_heads  # Get from BERT config
-    
+
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        g_key_prefix=None,
-        g_value_prefix=None,
-        e_key_prefix=None,
-        e_value_prefix=None,
-        output_attentions=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            g_key_prefix=None,
+            g_value_prefix=None,
+            e_key_prefix=None,
+            e_value_prefix=None,
+            output_attentions=False,
     ):
         batch_size = hidden_states.size(0)
         device = hidden_states.device  # Get device from input tensor
@@ -199,7 +234,7 @@ class PromptedBertSelfAttention(BertSelfAttention):
         mixed_value_layer = self.value(hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)  # [batch_size, num_heads, seq_len, head_dim]
-        key_layer = self.transpose_for_scores(mixed_key_layer)      # [batch_size, num_heads, seq_len, head_dim]
+        key_layer = self.transpose_for_scores(mixed_key_layer)  # [batch_size, num_heads, seq_len, head_dim]
         value_layer = self.transpose_for_scores(mixed_value_layer)  # [batch_size, num_heads, seq_len, head_dim]
 
         # Handle G-Prompt
@@ -214,7 +249,7 @@ class PromptedBertSelfAttention(BertSelfAttention):
             # Permute to [B, num_heads, dup, length, head_dim]
             g_key = g_key.permute(0, 2, 1, 3, 4)
             g_value = g_value.permute(0, 2, 1, 3, 4)
-            
+
             # Flatten dup*length => new_seq_len
             B, H, dup, L, D = g_key.shape
             g_key = g_key.reshape(B, H, dup * L, D)
@@ -223,7 +258,6 @@ class PromptedBertSelfAttention(BertSelfAttention):
             # Then concatenate
             key_layer = torch.cat([g_key, key_layer], dim=2)
             value_layer = torch.cat([g_value, value_layer], dim=2)
-            
 
         # E-Prompt logic
         if e_key_prefix is not None:
@@ -232,7 +266,7 @@ class PromptedBertSelfAttention(BertSelfAttention):
             e_value_prefix = e_value_prefix.to(device)
 
             # Remove the extra dim=2 which is "1"
-            e_key_prefix = e_key_prefix.squeeze(2)   # => [B, dup, H, L, D]
+            e_key_prefix = e_key_prefix.squeeze(2)  # => [B, dup, H, L, D]
             e_value_prefix = e_value_prefix.squeeze(2)
 
             # Permute to [B, H, dup, L, D]
@@ -248,9 +282,9 @@ class PromptedBertSelfAttention(BertSelfAttention):
             key_layer = torch.cat([e_key_prefix, key_layer], dim=2)
             value_layer = torch.cat([e_value_prefix, value_layer], dim=2)
 
-
         # Compute attention scores
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # [batch_size, num_heads, seq_len + prompt_len_g + prompt_len_e , seq_len + prompt_len_g + prompt_len_e]
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1,
+                                                                         -2))  # [batch_size, num_heads, seq_len + prompt_len_g + prompt_len_e , seq_len + prompt_len_g + prompt_len_e]
         attention_scores /= math.sqrt(self.attention_head_size)
 
         # Suppose key_layer is now [B, heads, final_seq_len, head_dim]
@@ -262,23 +296,23 @@ class PromptedBertSelfAttention(BertSelfAttention):
 
             if added_prompt_len < 0:
                 raise ValueError("Prompt length mismatch: final_seq_len < orig_seq_len?")
-            
+
             # create 1s for the newly prepended prompt tokens
             prompt_mask = torch.ones(
-                (batch_size, added_prompt_len), 
+                (batch_size, added_prompt_len),
                 device=device, dtype=attention_mask.dtype
             )
-            updated_mask = torch.cat([prompt_mask, attention_mask], dim=1)   # shape => [B, final_seq_len]
-            
+            updated_mask = torch.cat([prompt_mask, attention_mask], dim=1)  # shape => [B, final_seq_len]
+
             # for BERT attn, expand to [B,1,1, final_seq_len]
             extended_attention_mask = updated_mask.unsqueeze(1).unsqueeze(2).float()
             attention_scores += extended_attention_mask
 
-
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
         attention_probs = self.dropout(attention_probs)
 
-        context_layer = torch.matmul(attention_probs, value_layer)  # [batch_size, num_heads, seq_len + prompt_len_g + prompt_len_e , head_dim]
+        context_layer = torch.matmul(attention_probs,
+                                     value_layer)  # [batch_size, num_heads, seq_len + prompt_len_g + prompt_len_e , head_dim]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
@@ -293,14 +327,14 @@ class PromptedBertAttention(BertAttention):
         self.self = PromptedBertSelfAttention(config)
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        g_key_prefix=None,
-        g_value_prefix=None,
-        e_key_prefix=None,
-        e_value_prefix=None,
-        output_attentions=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            g_key_prefix=None,
+            g_value_prefix=None,
+            e_key_prefix=None,
+            e_value_prefix=None,
+            output_attentions=False,
     ):
         self_outputs = self.self(
             hidden_states,

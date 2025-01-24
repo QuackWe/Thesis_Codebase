@@ -12,15 +12,17 @@ from sys import argv
 
 
 class MaskedActivityDataset(Dataset):
-    def __init__(self, traces, tokenizer, mask_prob=0.15):
+    def __init__(self, traces, times, tokenizer, mask_prob=0.15):
         """
         Dataset for Masked Activity Modeling (MAM).
         :param traces: List of activity sequences (list of lists).
+        :param times: List of normalized time sequences
         :param tokenizer: Hugging Face BERT tokenizer.
         :param mask_prob: Probability of masking each activity.
         :param max_seq_length: Maximum length of activity traces.
         """
         self.traces = traces
+        self.times = times
         self.tokenizer = tokenizer
         self.mask_prob = mask_prob
         self.max_seq_length = self.get_max_trace_length()  # Dynamically compute max sequence length
@@ -29,8 +31,9 @@ class MaskedActivityDataset(Dataset):
         return len(self.traces)
 
     def __getitem__(self, idx):
-        # Original trace
+        # Original trace an times
         original_trace = self.traces[idx]
+        time_values = self.times[idx]
 
         # Apply random masking
         masked_trace, labels = self.apply_random_masking(original_trace)
@@ -57,11 +60,13 @@ class MaskedActivityDataset(Dataset):
         input_ids = tokenized_trace["input_ids"].squeeze(0)  # Shape: (max_seq_length)
         attention_mask = tokenized_trace["attention_mask"].squeeze(0)
         labels = tokenized_labels["input_ids"].squeeze(0)
+        times = torch.tensor(time_values, dtype=torch.float)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels
+            "labels": labels,
+            "time_values": times
         }
 
     def get_max_trace_length(self):
@@ -106,6 +111,7 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            time_values = batch["time_values"].to(device)
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss / accumulation_steps  # Divide loss by accumulation steps
@@ -122,6 +128,4 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
 
         print(f"Epoch {epoch + 1}: Average Loss = {total_loss / len(dataloader)}")
 
-    # print("MAM pretraining complete. Saving model...")
-    # model.save_pretrained('datasets/mam_pretrained_model')
-    # print("Pretrained model saved.")
+
