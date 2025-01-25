@@ -46,7 +46,7 @@ class MultitaskBERTModel(nn.Module):
         # Outcome head (maps [batch, hidden_dim] -> [batch, num_outcomes])
         self.outcome_head = nn.Sequential(
             nn.Dropout(p=0.1),
-            nn.Linear(config.embedding_dim, config.hidden_dim // 2),
+            nn.Linear(config.embedding_dim + config.loop_feat_dim, config.hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(config.hidden_dim // 2, config.num_outcomes)
         )
@@ -62,7 +62,7 @@ class MultitaskBERTModel(nn.Module):
         if torch.cuda.is_available():
             self.prompted_bert = self.prompted_bert.to(torch.cuda.current_device())
 
-    def forward(self, input_ids, attention_mask, times, customer_type=None):
+    def forward(self, input_ids, attention_mask, times, loop_features=None, customer_type=None):
         """
         Args:
             input_ids:       [batch_size, seq_len]        Token/Activity IDs
@@ -124,14 +124,24 @@ class MultitaskBERTModel(nn.Module):
 
         # 3) Outcome Prediction (single label per sequence)
         #    Average pooling across valid tokens, determined by attention_mask
-        mask_expanded = attention_mask.unsqueeze(-1).expand_as(last_hidden_state).float()
+        mask_expanded = attention_mask.unsqueeze(-1).float().expand_as(last_hidden_state)
         sum_embeddings = (last_hidden_state * mask_expanded).sum(dim=1)  # [batch_size, hidden_dim]
         sum_mask = mask_expanded.sum(dim=1).clamp_min(1e-9)  # [batch_size, hidden_dim]
         pooled_output = sum_embeddings / sum_mask  # [batch_size, hidden_dim]
 
+        # Convert to hidden dimension
         pooled_output = self.shared_hidden(pooled_output)
         pooled_output = self.shared_activation(pooled_output)
         pooled_output = self.dropout(pooled_output)
+
+        # Concatenate loop features if provided
+        # Before concatenation, ensure both tensors have same dimensions
+        if loop_features is not None:
+            # Ensure loop_features has shape [batch_size, feature_dim]
+            if loop_features.dim() == 1:
+                loop_features = loop_features.unsqueeze(0)
+            pooled_output = torch.cat([pooled_output, loop_features], dim=1)
+
         outcome_logits = self.outcome_head(pooled_output)
         # Shape => [batch_size, config.num_outcomes]
 
@@ -185,7 +195,7 @@ class DynamicWeightedLoss:
 loss_weighter = DynamicWeightedLoss()
 
 
-def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=False,
+def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=True,
                 accumulation_steps=4):
     """
     Fine-tune the multitask model with class weights for outcome prediction.
@@ -254,6 +264,7 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
             input_ids = batch['trace'].to(device)
             attention_mask = batch['mask'].to(device)
             customer_types = batch['customer_type'].to(device)
+            loop_feats = batch['loop_features'].to(device)  # ← Get loop features
             times = batch['times'].to(device)
             next_activity_labels = batch['next_activity'].to(device)
             outcome_labels = batch['outcome'].to(device)
@@ -268,7 +279,7 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
                 print("========================")
 
             # Forward pass
-            next_activity_logits, outcome_logits = model(input_ids, attention_mask, times, customer_types)
+            next_activity_logits, outcome_logits = model(input_ids, attention_mask, times, loop_feats, customer_types)
 
             # --- Next Activity Loss ---
             # Flatten (batch_size * seq_len) to align with cross-entropy:

@@ -1,5 +1,6 @@
 from model import MultitaskBERTModel, train_model
 from dataloader import TraceDataset
+from FeatureEngineering import add_loop_features
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
@@ -26,6 +27,7 @@ class Config:
         self.e_prompt_length = 10
         self.prompt_prefix_size = 5
         self.prefix_tune = True
+        self.loop_feat_dim = 3  # the number of columns in loop_features
 
 
 # Main block for training
@@ -37,6 +39,22 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print('Device: ', device)
+
+    # Load mappings
+    mappings = torch.load(f'datasets/{log}/mappings_consistent.pt')
+
+    # Define activities to monitor for each outcome
+    loop_activities_by_outcome = {
+        0: ['Funnel_Offerte uitbrengen', 'Mailing_Controle rentekorting hyp.'],
+        # Activities that loop in unsuccessful cases
+        1: ['Funnel_Huismap vullen']  # Activities that loop in successful cases
+    }
+
+    # Add loop features to dataset
+    add_loop_features(pytorch_dataset, mappings, loop_activities_by_outcome)
+
+    # Create DataLoader with updated collate_fn
+    dataloader = DataLoader(pytorch_dataset, batch_size=8, shuffle=True)
 
     # Check if MAM is already pretrained
     pretrained_weights = f"datasets/{log}/mam_pretrained_model"
@@ -65,9 +83,6 @@ if __name__ == "__main__":
 
     # Create configuration for fine-tuning
     config = Config(pytorch_dataset)
-
-    # Create DataLoader for fine-tuning
-    dataloader = DataLoader(pytorch_dataset, batch_size=8, shuffle=True)  # Adjust batch size as needed
 
     # Initialize Multitask Model with pretrained weights
     multitask_model = MultitaskBERTModel(config, pretrained_weights=pretrained_weights).to(device)

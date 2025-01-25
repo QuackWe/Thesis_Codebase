@@ -15,6 +15,21 @@ pretrained_weights = f"datasets/{log}/mam_pretrained_model"
 
 config = Config(pytorch_dataset)
 
+# Load mappings
+mappings = torch.load(f'datasets/{log}/mappings_consistent.pt')
+
+# Define the same loop activities as in training
+loop_activities_by_outcome = {
+    0: ['Funnel_Offerte uitbrengen', 'Mailing_Controle rentekorting hyp.'],
+    # Activities that loop in unsuccessful cases
+    1: ['Funnel_Huismap vullen']  # Activities that loop in successful cases
+}
+
+# Add loop features to dataset
+from FeatureEngineering import add_loop_features
+
+add_loop_features(pytorch_dataset, mappings, loop_activities_by_outcome)
+
 # Load the model
 model = MultitaskBERTModel(config, pretrained_weights=pretrained_weights).to(device)
 # Load state_dict with strict=False to handle potential mismatches
@@ -43,6 +58,7 @@ def evaluate_example(model, dataset, index, device):
     times = example['times'].unsqueeze(0).to(device)  # shape [1, seq_len]
     mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
     customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
+    loop_features = example['loop_features'].unsqueeze(0).to(device)
 
     # Ensure all inputs have valid shapes
     assert trace.size(1) > 0, "Trace input is empty"
@@ -54,7 +70,7 @@ def evaluate_example(model, dataset, index, device):
 
     # Make predictions
     with torch.no_grad():
-        next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
+        next_activity_logits, outcome_logits = model(trace, mask, times, loop_features, customer_type)
         predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[0]  # Sequence-level predictions
         predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
 
@@ -121,9 +137,10 @@ def evaluate_per_concept(model, dataset, device):
             mask = example['mask'].unsqueeze(0).to(device)
             times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)
+            loop_features = example['loop_features'].unsqueeze(0).to(device)
 
             # Get predictions
-            next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
+            next_activity_logits, outcome_logits = model(trace, mask, times, loop_features, customer_type)
 
             # Store predictions by concept
             c_type = customer_type.item()
@@ -205,10 +222,11 @@ def evaluate_model(model, dataset, device):
             mask = example['mask'].unsqueeze(0).to(device)  # Add batch dimension
             times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)  # Add batch dimension
+            loop_features = example['loop_features'].unsqueeze(0).to(device)
             real_next_activity = example['next_activity'].tolist()
             real_outcome = example['outcome'].item()
 
-            next_activity_logits, outcome_logits = model(trace, mask, times, customer_type)
+            next_activity_logits, outcome_logits = model(trace, mask, times, loop_features, customer_type)
             predicted_next_activity = torch.argmax(next_activity_logits, dim=2).tolist()[
                 0]  # Sequence-level predictions
             predicted_outcome = torch.argmax(outcome_logits, dim=1).item()  # Single-label prediction
@@ -289,6 +307,75 @@ def evaluate_model(model, dataset, device):
         print(f"  Precision: {precision:.4f}")
         print(f"  Recall: {recall:.4f}")
 
+
+def analyze_loop_feature_importance(model, dataset, device):
+    """
+    Analyze the importance of loop features by comparing predictions
+    with and without these features.
+    """
+    print("\n=== Loop Feature Importance Analysis ===")
+
+    model.eval()
+    results = defaultdict(lambda: {
+        'original': {'outcome': [], 'next_activity': []},
+        'perturbed': {'outcome': [], 'next_activity': []}
+    })
+
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            example = dataset[i]
+            trace = example['trace'].unsqueeze(0).to(device)
+            mask = example['mask'].unsqueeze(0).to(device)
+            times = example['times'].unsqueeze(0).to(device)
+            customer_type = example['customer_type'].unsqueeze(0).to(device)
+            loop_features = example['loop_features'].unsqueeze(0).to(device)
+
+            # Original predictions
+            next_act_logits, outcome_logits = model(
+                trace, mask, times, loop_features, customer_type
+            )
+
+            # Predictions without loop features
+            perturbed_features = torch.zeros_like(loop_features)
+            next_act_logits_p, outcome_logits_p = model(
+                trace, mask, times, perturbed_features, customer_type
+            )
+
+            # Store predictions
+            results[i]['original']['outcome'] = torch.softmax(outcome_logits, dim=1)
+            results[i]['original']['next_activity'] = torch.softmax(next_act_logits, dim=2)
+            results[i]['perturbed']['outcome'] = torch.softmax(outcome_logits_p, dim=1)
+            results[i]['perturbed']['next_activity'] = torch.softmax(next_act_logits_p, dim=2)
+
+    # Compute average impact
+    outcome_impact = torch.mean(torch.abs(
+        torch.cat([r['original']['outcome'] for r in results.values()]) -
+        torch.cat([r['perturbed']['outcome'] for r in results.values()])
+    )).item()
+
+    next_act_impact = torch.mean(torch.abs(
+        torch.cat([r['original']['next_activity'].view(-1) for r in results.values()]) -
+        torch.cat([r['perturbed']['next_activity'].view(-1) for r in results.values()])
+    )).item()
+
+    print(f"Average impact on outcome predictions: {outcome_impact:.4f}")
+    print(f"Average impact on next activity predictions: {next_act_impact:.4f}")
+
+    # Analyze impact by customer type
+    print("\nImpact by Customer Type:")
+    for c_type in set(dataset.customer_types):
+        indices = [i for i, x in enumerate(dataset.customer_types) if x == c_type]
+
+        c_outcome_impact = torch.mean(torch.abs(
+            torch.cat([results[i]['original']['outcome'] for i in indices]) -
+            torch.cat([results[i]['perturbed']['outcome'] for i in indices])
+        )).item()
+
+        print(f"Customer Type {c_type}: {c_outcome_impact:.4f}")
+
+
+# Add to the end of your eval.py:
+analyze_loop_feature_importance(model, pytorch_dataset, device)
 
 # Evaluate a single example
 evaluate_example(model, pytorch_dataset, index=5, device=device)
