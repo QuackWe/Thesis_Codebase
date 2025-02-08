@@ -1,16 +1,22 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel
 from tqdm import tqdm
 import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, Subset
 from Prompting.PromptedBert import PromptedBertModel
+from FeatureEngineering import analyze_feature_positions_for_bucketing, loop_activities_by_outcome, \
+    time_sensitive_transitions
 
 
 class MultitaskBERTModel(nn.Module):
     def __init__(self, config, pretrained_weights=None):
         super(MultitaskBERTModel, self).__init__()
         self.bert = BertModel.from_pretrained(pretrained_weights, output_hidden_states=True)
+
+        self.config = config  # Store config as model attribute
 
         # Freeze the first half of BERT layers to stabilize training
         for name, param in self.bert.named_parameters():
@@ -46,7 +52,7 @@ class MultitaskBERTModel(nn.Module):
         # Outcome head (maps [batch, hidden_dim] -> [batch, num_outcomes])
         self.outcome_head = nn.Sequential(
             nn.Dropout(p=0.1),
-            nn.Linear(config.embedding_dim + config.loop_feat_dim, config.hidden_dim // 2),
+            nn.Linear(config.outcome_head_input_dim, config.hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(config.hidden_dim // 2, config.num_outcomes)
         )
@@ -125,9 +131,9 @@ class MultitaskBERTModel(nn.Module):
         # 3) Outcome Prediction (single label per sequence)
         #    Average pooling across valid tokens, determined by attention_mask
         mask_expanded = attention_mask.unsqueeze(-1).float().expand_as(last_hidden_state)
-        sum_embeddings = (last_hidden_state * mask_expanded).sum(dim=1)  # [batch_size, hidden_dim]
-        sum_mask = mask_expanded.sum(dim=1).clamp_min(1e-9)  # [batch_size, hidden_dim]
-        pooled_output = sum_embeddings / sum_mask  # [batch_size, hidden_dim]
+        sum_embeddings = (last_hidden_state * mask_expanded).sum(dim=1)
+        sum_mask = mask_expanded.sum(dim=1).clamp_min(1e-9)
+        pooled_output = sum_embeddings / sum_mask
 
         # Convert to hidden dimension
         pooled_output = self.shared_hidden(pooled_output)
@@ -145,10 +151,20 @@ class MultitaskBERTModel(nn.Module):
         outcome_logits = self.outcome_head(pooled_output)
         # Shape => [batch_size, config.num_outcomes]
 
+        # Check for NaN in next activity logits
+        if torch.isnan(next_activity_logits).any():
+            print("NaN detected in next activity logits!")
+            # Add debugging information about the input that caused NaN
+
         return next_activity_logits, outcome_logits
 
 
-def compute_class_weights(dataloader, device, num_activities, num_outcomes):
+def compute_class_weights(dataloader, device, num_activities, num_outcomes, beta=0.999):
+    """
+    Compute class weights using effective samples following paper:
+    "Class-Balanced Loss Based on Effective Number of Samples"
+    """
+
     # Compute frequencies of each class for both tasks
     activity_counts = torch.zeros(num_activities).long()
     outcome_counts = torch.zeros(num_outcomes).long()
@@ -164,12 +180,13 @@ def compute_class_weights(dataloader, device, num_activities, num_outcomes):
         for o in outcome_labels:
             outcome_counts[o.item()] += 1
 
-    # Compute weights = 1 / frequency (normalized)
-    activity_weights = 1.0 / (activity_counts.float() + 1e-9)
-    activity_weights = activity_weights / activity_weights.sum() * len(activity_counts)
+    # Compute effective numbers
+    activity_weights = (1 - beta) / (1 - beta ** (activity_counts + 1))
+    outcome_weights = (1 - beta) / (1 - beta ** (outcome_counts + 1))
 
-    outcome_weights = 1.0 / (outcome_counts.float() + 1e-9)
-    outcome_weights = outcome_weights / outcome_weights.sum() * len(outcome_counts)
+    # Normalize weights
+    activity_weights = activity_weights / activity_weights.sum() * num_activities
+    outcome_weights = outcome_weights / outcome_weights.sum() * num_outcomes
 
     return activity_weights.to(device), outcome_weights.to(device)
 
@@ -195,8 +212,23 @@ class DynamicWeightedLoss:
 loss_weighter = DynamicWeightedLoss()
 
 
-def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=True,
-                accumulation_steps=4):
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+
+    def forward(self, input, target):
+        # Get cross entropy loss
+        ce_loss = F.cross_entropy(input, target, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        # Compute focal loss
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
+
+
+def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=False,
+                accumulation_steps=8):
     """
     Fine-tune the multitask model with class weights for outcome prediction.
     Args:
@@ -217,9 +249,13 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
     activity_weights, outcome_weights = compute_class_weights(dataloader, device, config.num_activities,
                                                               config.num_outcomes)
 
-    # Separate loss functions for each task with computed weights
-    next_activity_loss_fn = nn.CrossEntropyLoss(weight=activity_weights)
-    outcome_loss_fn = nn.CrossEntropyLoss(weight=outcome_weights)
+    # # Separate loss functions for each task with computed weights
+    # next_activity_loss_fn = nn.CrossEntropyLoss(weight=activity_weights)
+    # outcome_loss_fn = nn.CrossEntropyLoss(weight=outcome_weights)
+
+    # Create loss functions with focal loss
+    # next_activity_loss_fn = FocalLoss(weight=activity_weights, gamma=2.0)
+    # outcome_loss_fn = FocalLoss(weight=outcome_weights, gamma=2.0)
 
     model.train()
 
@@ -342,3 +378,172 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
         print(f"Average Total Loss: {avg_loss:.4f}")
         print(f"Average Next Activity Loss: {avg_next_activity_loss:.4f}")
         print(f"Average Outcome Loss: {avg_outcome_loss:.4f}")
+        # Save losses to file
+        with open('training_losses.csv', 'a') as f:
+            if epoch == 0:  # Write header if first epoch
+                f.write('epoch,total_loss,next_activity_loss,outcome_loss\n')
+            f.write(f'{epoch + 1},{avg_loss:.4f},{avg_next_activity_loss:.4f},{avg_outcome_loss:.4f}\n')
+
+
+def train_model_with_buckets(model, dataset, mappings, optimizer, device, config, num_epochs=5):
+    # Get buckets using existing feature engineering
+    buckets = analyze_feature_positions_for_bucketing(
+        dataset,
+        mappings,
+        loop_activities_by_outcome,
+        time_sensitive_transitions
+    )
+
+    print("\n=== Training Buckets ===")
+    for bucket_name, (min_len, max_len) in buckets.items():
+        print(f"Bucket {bucket_name}: {min_len} to {max_len if max_len else 'end'}")
+
+    # Create separate dataloaders for each bucket
+    bucket_dataloaders = {}
+    for bucket_name, (min_len, max_len) in buckets.items():
+        # Filter dataset by trace length
+        indices = []
+        for i in range(len(dataset)):
+            trace_length = (dataset.traces[i] != 0).sum().item()
+            if min_len <= trace_length and (max_len is None or trace_length <= max_len):
+                indices.append(i)
+
+        if indices:
+            bucket_dataset = torch.utils.data.Subset(dataset, indices)
+            bucket_dataloaders[bucket_name] = DataLoader(
+                bucket_dataset,
+                batch_size=8,
+                shuffle=True
+            )
+            print(f"Bucket {bucket_name}: {len(indices)} samples")
+
+    # Training loop with buckets
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
+        for bucket_name, dataloader in bucket_dataloaders.items():
+            print(f"\nTraining on {bucket_name} traces...")
+            train_model(model, dataloader, optimizer, device, config, num_epochs=1)
+
+
+def train_model_with_curriculum(model, dataset, mappings, optimizer, device, config, num_epochs=5):
+    """Train model using curriculum learning - starting with shorter sequences"""
+
+    # Get buckets using existing feature positions
+    buckets = analyze_feature_positions_for_bucketing(
+        dataset,
+        mappings,
+        loop_activities_by_outcome,
+        time_sensitive_transitions
+    )
+
+    # Sort buckets by sequence length
+    sorted_buckets = sorted(buckets.items(), key=lambda x: int(x[1][0]))  # Sort by min_len
+
+    print("\n=== Curriculum Learning Stages ===")
+    for stage, (bucket_name, (min_len, max_len)) in enumerate(sorted_buckets):
+        print(f"Stage {stage + 1}: {bucket_name} (length {min_len} to {max_len if max_len else 'end'})")
+
+    # Initialize metrics storage
+    stage_metrics = {}
+
+    # Train progressively through stages
+    for stage, (bucket_name, (min_len, max_len)) in enumerate(sorted_buckets):
+        print(f"\n=== Training Stage {stage + 1}: {bucket_name} ===")
+
+        # Create dataset for current and all previous stages
+        indices = []
+        for i in range(len(dataset)):
+            trace_length = (dataset.traces[i] != 0).sum().item()
+            if trace_length <= (max_len if max_len else float('inf')):
+                indices.append(i)
+
+        if indices:
+            # Create dataloader for current curriculum stage
+            stage_dataset = torch.utils.data.Subset(dataset, indices)
+            stage_dataloader = DataLoader(
+                stage_dataset,
+                batch_size=8,
+                shuffle=True
+            )
+            print(f"Samples in current stage: {len(indices)}")
+
+            # Train for this stage
+            for epoch in range(num_epochs):
+                print(f"\nEpoch {epoch + 1}/{num_epochs} (Stage {stage + 1})")
+
+                total_loss = 0
+                next_activity_total_loss = 0
+                outcome_total_loss = 0
+
+                # Compute class weights for current stage
+                activity_weights, outcome_weights = compute_class_weights(
+                    stage_dataloader, device, config.num_activities, config.num_outcomes
+                )
+
+                # Create loss functions with focal loss
+                next_activity_loss_fn = FocalLoss(weight=activity_weights, gamma=2.0)
+                outcome_loss_fn = FocalLoss(weight=outcome_weights, gamma=2.0)
+
+                # Initialize dynamic loss weighter
+                loss_weighter = DynamicWeightedLoss()
+
+                progress_bar = tqdm(enumerate(stage_dataloader), total=len(stage_dataloader),
+                                    desc=f"Stage {stage + 1} Epoch {epoch + 1}")
+
+                for step, batch in progress_bar:
+                    # Existing training loop code here
+                    optimizer.zero_grad()
+
+                    # Forward pass
+                    next_activity_logits, outcome_logits = model(
+                        batch['trace'].to(device),
+                        batch['mask'].to(device),
+                        batch['times'].to(device),
+                        batch['loop_features'].to(device),
+                        batch['customer_type'].to(device)
+                    )
+
+                    # Calculate losses (using existing loss computation code)
+                    next_activity_loss = next_activity_loss_fn(
+                        next_activity_logits, batch, next_activity_loss_fn, device
+                    )
+                    outcome_loss = outcome_loss_fn(
+                        outcome_logits, batch['outcome'].to(device)
+                    )
+
+                    # Dynamic loss weighting
+                    task_weights = loss_weighter.update([
+                        next_activity_loss.item(),
+                        outcome_loss.item()
+                    ])
+
+                    # Combined loss
+                    loss = (task_weights[0] * next_activity_loss +
+                            task_weights[1] * outcome_loss)
+
+                    # Backward pass
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                    # Update metrics
+                    total_loss += loss.item()
+                    next_activity_total_loss += next_activity_loss.item()
+                    outcome_total_loss += outcome_loss.item()
+
+                    progress_bar.set_postfix({
+                        'loss': f"{loss.item():.4f}",
+                        'next_act': f"{next_activity_loss.item():.4f}",
+                        'outcome': f"{outcome_loss.item():.4f}"
+                    })
+
+                # Store stage metrics
+                stage_metrics[f"stage_{stage + 1}_epoch_{epoch + 1}"] = {
+                    'avg_loss': total_loss / len(stage_dataloader),
+                    'next_activity_loss': next_activity_total_loss / len(stage_dataloader),
+                    'outcome_loss': outcome_total_loss / len(stage_dataloader)
+                }
+                print(stage_metrics)
+
+    return stage_metrics

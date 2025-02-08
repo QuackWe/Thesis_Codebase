@@ -12,7 +12,7 @@ from sys import argv
 
 
 class MaskedActivityDataset(Dataset):
-    def __init__(self, traces, times, tokenizer, mask_prob=0.15):
+    def __init__(self, traces, times, tokenizer, mask_prob=0.15, max_bert_length=512):
         """
         Dataset for Masked Activity Modeling (MAM).
         :param traces: List of activity sequences (list of lists).
@@ -25,7 +25,16 @@ class MaskedActivityDataset(Dataset):
         self.times = times
         self.tokenizer = tokenizer
         self.mask_prob = mask_prob
-        self.max_seq_length = self.get_max_trace_length()  # Dynamically compute max sequence length
+
+        self.raw_max_seq_length = self.get_max_trace_length()
+        # Truncate global max length to avoid BERT dimension errors
+        self.max_seq_length = min(self.raw_max_seq_length, max_bert_length)
+
+        print(f"Raw max seq length in dataset: {self.raw_max_seq_length}. "
+              f"Using max_seq_length={self.max_seq_length} for BERT.")
+
+        if len(self.traces) != len(self.times):
+            raise ValueError(f"Mismatched traces/times: {len(self.traces)} vs {len(self.times)}")
 
     def __len__(self):
         return len(self.traces)
@@ -60,17 +69,20 @@ class MaskedActivityDataset(Dataset):
         input_ids = tokenized_trace["input_ids"].squeeze(0)  # Shape: (max_seq_length)
         attention_mask = tokenized_trace["attention_mask"].squeeze(0)
         labels = tokenized_labels["input_ids"].squeeze(0)
-        times = torch.tensor(time_values, dtype=torch.float)
+        # Convert times to a tensor, then pad or truncate to self.max_seq_length
+        time_tensor = torch.zeros(self.max_seq_length, dtype=torch.float)
+        truncated_time_values = time_values[:self.max_seq_length]
+        time_tensor[:len(truncated_time_values)] = torch.tensor(truncated_time_values, dtype=torch.float)
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
-            "time_values": times
+            "time_values": time_tensor
         }
 
     def get_max_trace_length(self):
-        """Compute the length of the longest trace."""
+        """Compute the raw length of the longest trace in self.traces."""
         return max(len(trace) for trace in self.traces)
 
     def apply_random_masking(self, activities):
@@ -94,7 +106,7 @@ class MaskedActivityDataset(Dataset):
         return masked_activities, labels
 
 
-def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_steps=2):
+def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_steps=16):
     """
     Train the BERT model for Masked Activity Modeling (MAM) with gradient accumulation.
     :param accumulation_steps: Number of batches to accumulate gradients before an optimization step.
@@ -103,6 +115,8 @@ def train_mam(dataloader, model, optimizer, device, num_epochs=3, accumulation_s
     loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
     for epoch in range(num_epochs):
+        if epoch % 5 == 0:  # Clear cache periodically
+            torch.cuda.empty_cache()
         total_loss = 0
         progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch + 1}/{num_epochs}")
         optimizer.zero_grad()  # Zero gradients before the accumulation loop
