@@ -1,6 +1,6 @@
 from model import MultitaskBERTModel, train_model, train_model_with_buckets, train_model_with_curriculum
 from dataloader import TraceDataset
-from FeatureEngineering import add_all_features, loop_activities_by_outcome, time_sensitive_transitions
+from FeatureEngineering import add_all_features, define_features
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
@@ -16,19 +16,18 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 torch.cuda.empty_cache()
 
 
-# Configuration setup
 class Config:
     def __init__(self, pytorch_dataset):
-        if hasattr(pytorch_dataset, 'trace_mmap'):  # If it's a memory-mapped dataset
-            # Get num_activities from trace data
+        if isinstance(pytorch_dataset, MemoryMappedDataset):
             self.num_activities = int(pytorch_dataset.trace_mmap.max()) + 1
             self.max_seq_length = pytorch_dataset.trace_mmap.shape[1]
-            # Get num_outcomes from metadata
             self.num_outcomes = max(pytorch_dataset.meta['Outcome']) + 1
-        else:  # Regular dataset
+        elif hasattr(pytorch_dataset, 'traces'):
             self.num_activities = pytorch_dataset.traces.max().item() + 1
             self.max_seq_length = pytorch_dataset.traces.shape[1]
             self.num_outcomes = pytorch_dataset.outcomes.max().item() + 1
+        else:
+            raise ValueError("Unsupported dataset format")
 
         # Rest of the configuration remains the same
         self.embedding_dim = 768
@@ -40,8 +39,18 @@ class Config:
         self.e_prompt_length = 10
         self.prompt_prefix_size = 5
         self.prefix_tune = True
-        self.loop_feat_dim = sum([len(activities) for activities in loop_activities_by_outcome.values()])
-        self.temporal_feat_dim = len(time_sensitive_transitions) * 2
+        # With dynamic feature dimension calculation:
+        self.loop_feat_dim = 0
+        self.temporal_feat_dim = 0
+
+        if hasattr(pytorch_dataset, 'loop_features'):
+            self.loop_feat_dim = pytorch_dataset.loop_features.shape[
+                1] if pytorch_dataset.loop_features is not None else 0
+
+        if hasattr(pytorch_dataset, 'temporal_features'):
+            self.temporal_feat_dim = pytorch_dataset.temporal_features.shape[
+                1] if pytorch_dataset.temporal_features is not None else 0
+
         self.total_feature_dim = self.loop_feat_dim + self.temporal_feat_dim
         self.outcome_head_input_dim = self.embedding_dim + self.total_feature_dim
 
@@ -49,6 +58,8 @@ class Config:
 # Main block for training
 if __name__ == "__main__":
     log = argv[1]
+
+    loop_activities_by_outcome, time_sensitive_transitions = define_features(log)
 
     # Load the saved dataset
     pytorch_data_ref = torch.load(f'datasets/{log}/pytorch_dataset_consistent.pt')
@@ -68,7 +79,7 @@ if __name__ == "__main__":
     mappings = torch.load(f'datasets/{log}/mappings_consistent.pt')
 
     # Add both loop and temporal features
-    add_all_features(pytorch_dataset, mappings, loop_activities_by_outcome,
+    add_all_features(pytorch_dataset, log, mappings, loop_activities_by_outcome,
                      time_sensitive_transitions)
 
     # # Update collate_fn to include loop features
@@ -92,7 +103,7 @@ if __name__ == "__main__":
     if not os.path.exists(pretrained_weights):
         # If MAM not pretrained, do the pretraining
         print("Starting MAM pretraining...")
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", model_max_length=512)
         traces = [trace.tolist() for trace in pytorch_dataset.traces]  # Extract traces
         times = [time.tolist() for time in pytorch_dataset.times]  # Extract times
 
@@ -102,8 +113,8 @@ if __name__ == "__main__":
 
         mam_model = BertForMaskedLM.from_pretrained(
             "bert-base-uncased",
-            # attention_probs_dropout_prob=0.1,
-            # hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            hidden_dropout_prob=0.1,
             use_cache=False  # Disable key/value caching
         )  # Initialize BERT for MAM
 
@@ -131,17 +142,17 @@ if __name__ == "__main__":
 
     # Fine-tune the Multitask Model
     print("Starting multitask fine-tuning...")
-    # train_model(multitask_model, dataloader, optimizer, device, config, num_epochs=15)
+    train_model(multitask_model, dataloader, optimizer, device, config, num_epochs=15)
     # train_model_with_buckets(multitask_model, pytorch_dataset, mappings, optimizer, device, config, num_epochs=1)
-    stage_metrics = train_model_with_curriculum(
-        multitask_model,
-        pytorch_dataset,
-        mappings,
-        optimizer,
-        device,
-        config,
-        num_epochs=15
-    )
+    # stage_metrics = train_model_with_curriculum(
+    #     multitask_model,
+    #     pytorch_dataset,
+    #     mappings,
+    #     optimizer,
+    #     device,
+    #     config,
+    #     num_epochs=15
+    # )
     # Save the fine-tuned model
     multitask_model.prompted_bert.e_prompt.save_prompts(f'datasets/{log}')
     save_path = f'datasets/{log}/multitask_bert_model.pth'

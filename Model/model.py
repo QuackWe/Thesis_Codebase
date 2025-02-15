@@ -7,8 +7,7 @@ import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Subset
 from Prompting.PromptedBert import PromptedBertModel
-from FeatureEngineering import analyze_feature_positions_for_bucketing, loop_activities_by_outcome, \
-    time_sensitive_transitions
+from FeatureEngineering import analyze_feature_positions_for_bucketing
 
 
 class MultitaskBERTModel(nn.Module):
@@ -68,12 +67,12 @@ class MultitaskBERTModel(nn.Module):
         if torch.cuda.is_available():
             self.prompted_bert = self.prompted_bert.to(torch.cuda.current_device())
 
-    def forward(self, input_ids, attention_mask, times, loop_features=None, customer_type=None):
+    def forward(self, input_ids, attention_mask, times, loop_features=None, customer_types=None):
         """
         Args:
             input_ids:       [batch_size, seq_len]        Token/Activity IDs
             attention_mask:  [batch_size, seq_len]        1=valid token, 0=padding
-            customer_type:   [batch_size] or None         For concept drift adaptation
+            customer_types:   [batch_size] or None         For concept drift adaptation
             times:           [batch_size, seq_len]        Normalized time values
 
         Returns:
@@ -109,12 +108,18 @@ class MultitaskBERTModel(nn.Module):
         # Apply mask to zero out invalid positions while preserving gradient paths
         time_embeddings = time_embeddings * time_mask.expand_as(time_embeddings)
 
+        # Truncate oversize inputs
+        if input_ids.size(1) > 512:
+            input_ids = input_ids[:, :512].long()
+            attention_mask = attention_mask[:, :512]
+            times = times[:, :512]
+
         # Forward through prompted BERT
         last_hidden_state = self.prompted_bert(
             input_ids,
             attention_mask=attention_mask,
             times=times,
-            customer_type=customer_type
+            customer_type=customer_types
         )
 
         # 2) Next-Activity Prediction (per-step)
@@ -142,7 +147,7 @@ class MultitaskBERTModel(nn.Module):
 
         # Concatenate loop features if provided
         # Before concatenation, ensure both tensors have same dimensions
-        if loop_features is not None:
+        if loop_features is not None and loop_features.shape[1] > 0:
             # Ensure loop_features has shape [batch_size, feature_dim]
             if loop_features.dim() == 1:
                 loop_features = loop_features.unsqueeze(0)
@@ -228,7 +233,7 @@ class FocalLoss(nn.Module):
 
 
 def train_model(model, dataloader, optimizer, device, config, num_epochs=5, print_batch_data=False,
-                accumulation_steps=8):
+                accumulation_steps=16):
     """
     Fine-tune the multitask model with class weights for outcome prediction.
     Args:
@@ -254,8 +259,8 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
     # outcome_loss_fn = nn.CrossEntropyLoss(weight=outcome_weights)
 
     # Create loss functions with focal loss
-    # next_activity_loss_fn = FocalLoss(weight=activity_weights, gamma=2.0)
-    # outcome_loss_fn = FocalLoss(weight=outcome_weights, gamma=2.0)
+    # next_activity_loss_fn = FocalLoss(weight=activity_weights, gamma=2.0).to(device)
+    # outcome_loss_fn = FocalLoss(weight=outcome_weights, gamma=2.0).to(device)
 
     model.train()
 
@@ -275,7 +280,7 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
 
     # Create loss functions:
     # Standard CE for next activity prediction
-    next_activity_loss_fn = nn.CrossEntropyLoss().to(device)
+    next_activity_loss_fn = nn.CrossEntropyLoss(weight=activity_weights).to(device)
     # Weighted CE for outcome prediction
     outcome_loss_fn = nn.CrossEntropyLoss(weight=outcome_weights).to(device)
 
@@ -297,10 +302,10 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
             if torch.isnan(batch['times']).any():
                 raise ValueError(f"NaN values found in batch times: {torch.isnan(batch['times']).sum().item()}")
 
-            input_ids = batch['trace'].to(device)
+            input_ids = batch['trace'].long().to(device)
             attention_mask = batch['mask'].to(device)
-            customer_types = batch['customer_type'].to(device)
-            loop_feats = batch['loop_features'].to(device)  # ← Get loop features
+            customer_type = batch['customer_type'].to(device)
+            loop_feats = batch.get('loop_features', None)  # Use get() with default None
             times = batch['times'].to(device)
             next_activity_labels = batch['next_activity'].to(device)
             outcome_labels = batch['outcome'].to(device)
@@ -310,30 +315,52 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
                 print("Input IDs (trace):", input_ids)
                 print("Relative Time:", times)
                 print("Attention Mask:", attention_mask)
-                print("Customer Types:", customer_types)
+                print("Customer Types:", customer_type)
                 print("Outcome Labels:", outcome_labels)
                 print("========================")
 
             # Forward pass
-            next_activity_logits, outcome_logits = model(input_ids, attention_mask, times, loop_feats, customer_types)
+            next_activity_logits, outcome_logits = model(
+                input_ids,
+                attention_mask,
+                times,
+                loop_features=loop_feats.to(device) if loop_feats is not None else None,
+                customer_types=customer_type
+            )
 
             # --- Next Activity Loss ---
             # Flatten (batch_size * seq_len) to align with cross-entropy:
             next_activity_logits_2d = next_activity_logits.view(-1, config.num_activities)
             next_activity_labels_1d = next_activity_labels.view(-1)
 
-            # We only want valid positions (not padded). Flatten the attention_mask:
-            valid_mask = attention_mask.view(-1).bool()
-            # Add padding mask
-            padding_mask = (input_ids != 0).view(-1).bool()
-            # Combine masks to only consider non-padding valid positions
+            # # We only want valid positions (not padded). Flatten the attention_mask:
+            # valid_mask = attention_mask.view(-1).bool()
+            # # Add padding mask
+            # padding_mask = (input_ids != 0).view(-1).bool()
+            # # Combine masks to only consider non-padding valid positions
+            # final_mask = valid_mask & padding_mask
+            # Get actual sequence length from model outputs
+            seq_len = next_activity_logits.shape[1]  # Get the actual sequence length from model
+
+            # Rebuild masks to match model's output sequence length
+            # Truncate masks to match the model's output sequence length
+            valid_mask = batch['mask'][:, :seq_len].contiguous().view(-1).bool()
+            padding_mask = (batch['trace'][:, :seq_len] != 0).contiguous().view(-1).bool()
             final_mask = valid_mask & padding_mask
 
+            # Truncate and flatten labels to match model output
+            next_activity_labels = batch['next_activity'][:, :seq_len].contiguous().view(-1)  # NEW
+            next_activity_labels_1d = next_activity_labels.to(device)  # MODIFIED
+
+            # Existing code remains...
             valid_activity_logits = next_activity_logits_2d[final_mask]
-            valid_activity_labels = next_activity_labels_1d[final_mask]
+            valid_activity_labels = next_activity_labels_1d[final_mask]  # Now aligned
 
             next_activity_loss = next_activity_loss_fn(valid_activity_logits, valid_activity_labels)
-
+            print(f"Model output seq length: {seq_len}")
+            print(f"Mask shape: {final_mask.shape}")
+            print(f"Logits shape: {next_activity_logits_2d.shape}")
+            print(f"Labels shape: {next_activity_labels.shape}")
             # --- Outcome Loss ---
             # One outcome per sequence, so no flattening.
             # outcome_logits: [batch_size, num_outcomes], outcome_labels: [batch_size]
@@ -385,13 +412,12 @@ def train_model(model, dataloader, optimizer, device, config, num_epochs=5, prin
             f.write(f'{epoch + 1},{avg_loss:.4f},{avg_next_activity_loss:.4f},{avg_outcome_loss:.4f}\n')
 
 
-def train_model_with_buckets(model, dataset, mappings, optimizer, device, config, num_epochs=5):
+def train_model_with_buckets(model, log, dataset, mappings, optimizer, device, config, num_epochs=5):
     # Get buckets using existing feature engineering
     buckets = analyze_feature_positions_for_bucketing(
         dataset,
-        mappings,
-        loop_activities_by_outcome,
-        time_sensitive_transitions
+        log,
+        mappings
     )
 
     print("\n=== Training Buckets ===")
@@ -427,123 +453,142 @@ def train_model_with_buckets(model, dataset, mappings, optimizer, device, config
 
 
 def train_model_with_curriculum(model, dataset, mappings, optimizer, device, config, num_epochs=5):
-    """Train model using curriculum learning - starting with shorter sequences"""
+    """Train model using curriculum learning with progressive difficulty and balanced sampling"""
 
-    # Get buckets using existing feature positions
-    buckets = analyze_feature_positions_for_bucketing(
-        dataset,
-        mappings,
-        loop_activities_by_outcome,
-        time_sensitive_transitions
-    )
+    # Get buckets using trace length distribution
+    trace_lengths = []
+    for i in range(len(dataset)):
+        trace = dataset.traces[i]
+        trace_length = (trace != 0).sum().item()
+        trace_lengths.append(trace_length)
 
-    # Sort buckets by sequence length
-    sorted_buckets = sorted(buckets.items(), key=lambda x: int(x[1][0]))  # Sort by min_len
+    # Calculate length percentiles for balanced bucketing
+    length_25th = np.percentile(trace_lengths, 25)
+    length_75th = np.percentile(trace_lengths, 75)
+
+    buckets = {
+        'short': (1, int(length_25th)),
+        'medium': (int(length_25th) + 1, int(length_75th)),
+        'long': (int(length_75th) + 1, None)
+    }
 
     print("\n=== Curriculum Learning Stages ===")
-    for stage, (bucket_name, (min_len, max_len)) in enumerate(sorted_buckets):
+    for stage, (bucket_name, (min_len, max_len)) in enumerate(buckets.items()):
         print(f"Stage {stage + 1}: {bucket_name} (length {min_len} to {max_len if max_len else 'end'})")
 
-    # Initialize metrics storage
     stage_metrics = {}
+    accumulated_indices = []
 
     # Train progressively through stages
-    for stage, (bucket_name, (min_len, max_len)) in enumerate(sorted_buckets):
+    for stage, (bucket_name, (min_len, max_len)) in enumerate(buckets.items()):
         print(f"\n=== Training Stage {stage + 1}: {bucket_name} ===")
 
-        # Create dataset for current and all previous stages
-        indices = []
+        # Get indices for current stage
+        stage_indices = []
         for i in range(len(dataset)):
             trace_length = (dataset.traces[i] != 0).sum().item()
-            if trace_length <= (max_len if max_len else float('inf')):
-                indices.append(i)
+            if min_len <= trace_length <= (max_len if max_len else float('inf')):
+                stage_indices.append(i)
 
-        if indices:
-            # Create dataloader for current curriculum stage
-            stage_dataset = torch.utils.data.Subset(dataset, indices)
-            stage_dataloader = DataLoader(
-                stage_dataset,
-                batch_size=8,
-                shuffle=True
+        # Add current stage indices to accumulated indices
+        accumulated_indices.extend(stage_indices)
+
+        # Create balanced dataset for current curriculum stage
+        stage_dataset = Subset(dataset, accumulated_indices)
+        stage_dataloader = DataLoader(
+            stage_dataset,
+            batch_size=8,
+            shuffle=True
+        )
+
+        print(f"Samples in current stage: {len(accumulated_indices)}")
+
+        # Train for this stage
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch + 1}/{num_epochs} (Stage {stage + 1})")
+
+            # Compute class weights for current stage
+            activity_weights, outcome_weights = compute_class_weights(
+                stage_dataloader, device, config.num_activities, config.num_outcomes
             )
-            print(f"Samples in current stage: {len(indices)}")
 
-            # Train for this stage
-            for epoch in range(num_epochs):
-                print(f"\nEpoch {epoch + 1}/{num_epochs} (Stage {stage + 1})")
+            # Initialize loss functions with class weights
+            next_activity_loss_fn = FocalLoss(
+                weight=activity_weights,
+                gamma=2.0
+            ).to(device)
 
-                total_loss = 0
-                next_activity_total_loss = 0
-                outcome_total_loss = 0
+            outcome_loss_fn = FocalLoss(
+                weight=outcome_weights,
+                gamma=2.0
+            ).to(device)
 
-                # Compute class weights for current stage
-                activity_weights, outcome_weights = compute_class_weights(
-                    stage_dataloader, device, config.num_activities, config.num_outcomes
+            # Training loop
+            model.train()
+            total_loss = 0
+            next_activity_total_loss = 0
+            outcome_total_loss = 0
+
+            progress_bar = tqdm(enumerate(stage_dataloader),
+                                total=len(stage_dataloader),
+                                desc=f"Stage {stage + 1} Epoch {epoch + 1}")
+
+            for step, batch in progress_bar:
+                optimizer.zero_grad()
+
+                # Forward pass
+                next_activity_logits, outcome_logits = model(
+                    batch['trace'].to(device),
+                    batch['mask'].to(device),
+                    batch['times'].to(device),
+                    batch['loop_features'].to(device),
+                    batch['customer_type'].to(device)
                 )
 
-                # Create loss functions with focal loss
-                next_activity_loss_fn = FocalLoss(weight=activity_weights, gamma=2.0)
-                outcome_loss_fn = FocalLoss(weight=outcome_weights, gamma=2.0)
+                # Calculate next activity loss with masking
+                valid_mask = batch['mask'].view(-1).bool()
+                padding_mask = (batch['trace'] != 0).view(-1).bool()
+                final_mask = valid_mask & padding_mask
 
-                # Initialize dynamic loss weighter
-                loss_weighter = DynamicWeightedLoss()
+                next_act_logits_2d = next_activity_logits.view(-1, config.num_activities)
+                next_act_labels_1d = batch['next_activity'].view(-1).to(device)
 
-                progress_bar = tqdm(enumerate(stage_dataloader), total=len(stage_dataloader),
-                                    desc=f"Stage {stage + 1} Epoch {epoch + 1}")
+                valid_logits = next_act_logits_2d[final_mask]
+                valid_labels = next_act_labels_1d[final_mask]
 
-                for step, batch in progress_bar:
-                    # Existing training loop code here
-                    optimizer.zero_grad()
+                next_activity_loss = next_activity_loss_fn(valid_logits, valid_labels)
 
-                    # Forward pass
-                    next_activity_logits, outcome_logits = model(
-                        batch['trace'].to(device),
-                        batch['mask'].to(device),
-                        batch['times'].to(device),
-                        batch['loop_features'].to(device),
-                        batch['customer_type'].to(device)
-                    )
+                # Calculate outcome loss
+                outcome_loss = outcome_loss_fn(
+                    outcome_logits,
+                    batch['outcome'].to(device)
+                )
 
-                    # Calculate losses (using existing loss computation code)
-                    next_activity_loss = next_activity_loss_fn(
-                        next_activity_logits, batch, next_activity_loss_fn, device
-                    )
-                    outcome_loss = outcome_loss_fn(
-                        outcome_logits, batch['outcome'].to(device)
-                    )
+                # Combined loss with dynamic weighting
+                loss = 0.6 * next_activity_loss + 0.4 * outcome_loss
 
-                    # Dynamic loss weighting
-                    task_weights = loss_weighter.update([
-                        next_activity_loss.item(),
-                        outcome_loss.item()
-                    ])
+                # Backward pass
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-                    # Combined loss
-                    loss = (task_weights[0] * next_activity_loss +
-                            task_weights[1] * outcome_loss)
+                # Update metrics
+                total_loss += loss.item()
+                next_activity_total_loss += next_activity_loss.item()
+                outcome_total_loss += outcome_loss.item()
 
-                    # Backward pass
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                progress_bar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'next_act': f"{next_activity_loss.item():.4f}",
+                    'outcome': f"{outcome_loss.item():.4f}"
+                })
 
-                    # Update metrics
-                    total_loss += loss.item()
-                    next_activity_total_loss += next_activity_loss.item()
-                    outcome_total_loss += outcome_loss.item()
-
-                    progress_bar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'next_act': f"{next_activity_loss.item():.4f}",
-                        'outcome': f"{outcome_loss.item():.4f}"
-                    })
-
-                # Store stage metrics
-                stage_metrics[f"stage_{stage + 1}_epoch_{epoch + 1}"] = {
-                    'avg_loss': total_loss / len(stage_dataloader),
-                    'next_activity_loss': next_activity_total_loss / len(stage_dataloader),
-                    'outcome_loss': outcome_total_loss / len(stage_dataloader)
-                }
-                print(stage_metrics)
+            # Store stage metrics
+            stage_metrics[f"stage_{stage + 1}_epoch_{epoch + 1}"] = {
+                'avg_loss': total_loss / len(stage_dataloader),
+                'next_activity_loss': next_activity_total_loss / len(stage_dataloader),
+                'outcome_loss': outcome_total_loss / len(stage_dataloader)
+            }
 
     return stage_metrics
+

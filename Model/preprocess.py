@@ -31,6 +31,33 @@ def get_trace_identifier(df, dataset_type):
     return df
 
 
+def calculate_global_normalized_times(df, group_col='trace_id'):
+    """Calculate time features with global normalization"""
+    print("\n=== Calculating global-normalized time features ===")
+
+    # Calculate relative times within traces
+    df['RelativeTime'] = df.groupby(group_col)['TimestampContact'].transform(
+        lambda x: (pd.to_datetime(x, format='%Y-%m-%d %H:%M:%S') -
+                   pd.to_datetime(x.iloc[0], format='%Y-%m-%d %H:%M:%S')
+                   ).dt.total_seconds() / 3600
+    )
+
+    # Calculate log time
+    df['LogTime'] = np.log1p(df['RelativeTime'])
+
+    # Global robust scaling
+    df['NormalizedTime'] = robust_scale(df['LogTime'])
+    df['NormalizedTime'] = df['NormalizedTime'].clip(-5, 5)
+
+    # Debug prints
+    print("Global time statistics:")
+    print(f"Median LogTime: {df['LogTime'].median():.2f}")
+    print(f"IQR LogTime: {df['LogTime'].quantile(0.75) - df['LogTime'].quantile(0.25):.2f}")
+    print(f"NormalizedTime range: [{df['NormalizedTime'].min():.2f}, {df['NormalizedTime'].max():.2f}]")
+
+    return df
+
+
 def normalize_timestamps(df, column_name, target_format='%Y-%m-%d %H:%M:%S'):
     """
     Converts timestamps in a given column to a uniform format, applying a series of fallback parsers.
@@ -241,6 +268,57 @@ def merge_funnel_lead_activities(df):
     return df
 
 
+def reduce_orientation_events(df):
+    """
+    Reduces consecutive Online_Oriëntatie events to first and last in each sequence.
+    Maintains all original columns and matches the style of other cleaning functions.
+    """
+    print("\n=== Reducing consecutive orientation events ===")
+    original_size = len(df)
+    print(f"Dataset size before orientation reduction: {original_size:,}")
+
+    # Create trace identifier if not exists
+    if 'trace_id' not in df.columns:
+        df = get_trace_identifier(df, 'application')
+
+    # Sort by trace and timestamp
+    df = df.sort_values(['trace_id', 'TimestampContact'])
+
+    # Process traces in groups
+    reduced_dfs = []
+    for trace_id, group in df.groupby('trace_id', sort=False):
+        activities = group['Activity'].tolist()
+        reduced_indices = []
+
+        i = 0
+        while i < len(activities):
+            if activities[i] == 'Online_OriÃ«ntatie':
+                start_idx = i
+                while i < len(activities) and activities[i] == 'Online_OriÃ«ntatie':
+                    i += 1
+                # Keep first and last if sequence length > 1
+                reduced_indices.append(start_idx)
+                if i - start_idx > 1:
+                    reduced_indices.append(i - 1)
+            else:
+                reduced_indices.append(i)
+                i += 1
+
+        # Preserve all original columns
+        reduced_dfs.append(group.iloc[reduced_indices])
+
+    # Combine results
+    reduced_df = pd.concat(reduced_dfs, ignore_index=True)
+
+    # Calculate and print statistics
+    removed_count = original_size - len(reduced_df)
+    print(f"Removed {removed_count} redundant orientation events")
+    print(f"Dataset size after orientation reduction: {len(reduced_df):,}")
+    print("=" * 50)
+
+    return reduced_df
+
+
 # --------------------------------------------------------------------
 # 2) Smaller "process_traces" function for mortgages & single-run sets
 # --------------------------------------------------------------------
@@ -439,25 +517,25 @@ def process_traces_in_batches(df, log_name, batch_size=1000, is_consistent=True)
     # Create Activity
     df['Activity'] = df['topic'].astype(str) + "_" + df['subtopic'].astype(str)
 
-    # Time features
-    df['RelativeTime'] = df.groupby(group_col)['TimestampContact'].transform(
-        lambda x: (
-                          pd.to_datetime(x, format='%Y-%m-%d %H:%M:%S')
-                          - pd.to_datetime(x.iloc[0], format='%Y-%m-%d %H:%M:%S')
-                  ).dt.total_seconds() / 3600
-    )
-    df['LogTime'] = np.log1p(df['RelativeTime'])
-    df['NormalizedTime'] = df.groupby(group_col)['LogTime'].transform(robust_scale)
-    df['NormalizedTime'] = df['NormalizedTime'].clip(-5, 5)
-
-    # Debug prints
-    print("\nInitial RelativeTime stats:")
-    print(df['RelativeTime'].describe())
-    print("NaN in RelativeTime:", df['RelativeTime'].isnull().sum())
-
-    print("\nLogTime stats:")
-    print(df['LogTime'].describe())
-    print("NaN in LogTime:", df['LogTime'].isnull().sum())
+    # # Time features
+    # df['RelativeTime'] = df.groupby(group_col)['TimestampContact'].transform(
+    #     lambda x: (
+    #                       pd.to_datetime(x, format='%Y-%m-%d %H:%M:%S')
+    #                       - pd.to_datetime(x.iloc[0], format='%Y-%m-%d %H:%M:%S')
+    #               ).dt.total_seconds() / 3600
+    # )
+    # df['LogTime'] = np.log1p(df['RelativeTime'])
+    # df['NormalizedTime'] = df.groupby(group_col)['LogTime'].transform(robust_scale)
+    # df['NormalizedTime'] = df['NormalizedTime'].clip(-5, 5)
+    #
+    # # Debug prints
+    # print("\nInitial RelativeTime stats:")
+    # print(df['RelativeTime'].describe())
+    # print("NaN in RelativeTime:", df['RelativeTime'].isnull().sum())
+    #
+    # print("\nLogTime stats:")
+    # print(df['LogTime'].describe())
+    # print("NaN in LogTime:", df['LogTime'].isnull().sum())
 
     n_nans = df['NormalizedTime'].isnull().sum()
     if n_nans > 0:
@@ -633,6 +711,10 @@ if __name__ == "__main__":
     if log == 'mortgages':
         df = pd.read_csv(input_file, encoding='latin-1')
         df = normalize_timestamps(df, 'TimestampContact')
+        df = get_trace_identifier(df, 'mortgages')
+
+        # Calculate time features FIRST
+        df = calculate_global_normalized_times(df)
         # Remove single-activity traces
         df = remove_single_activity_traces(df, log)
         # Merge Funnel_Lead activities before other processing
@@ -646,14 +728,21 @@ if __name__ == "__main__":
         # Large dataset approach
         df = pd.read_csv(input_file, encoding='latin-1', sep='|')
         df = normalize_timestamps(df, 'TimestampContact')
-        # Remove single-activity traces
-        df = remove_single_activity_traces(df, log)
-        # Remove single-activity traces before processing
+        df = get_trace_identifier(df, 'application')
+
+        # Calculate time features FIRST
+        df = calculate_global_normalized_times(df)
+
+         # Remove traces where only orientation browsing happens
         df = remove_orientation_activity_traces(df)
         # Remove Adobe Aanvraag activities before processing
         df = remove_adobe_aanvraag_activities(df)
         # Remove Contractwijziging activities before processing
         df = remove_contractwijziging_activities(df)
+        # Merge online orinetatie events
+        df = reduce_orientation_events(df)
+        # Remove single-activity traces
+        df = remove_single_activity_traces(df, log)
 
         batch_size = 100  # Adjust as needed
         process_traces_in_batches(df, log, batch_size=batch_size, is_consistent=True)

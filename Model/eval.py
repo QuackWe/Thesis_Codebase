@@ -5,25 +5,31 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 from collections import defaultdict
 from sys import argv
 import numpy as np
-from FeatureEngineering import loop_activities_by_outcome, time_sensitive_transitions
+from preprocess import MemoryMappedDataset
+from FeatureEngineering import add_all_features, define_features
 
 log = argv[1]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Device: ', device)
 
 # Load the saved dataset
-pytorch_dataset = torch.load('datasets/' + log + '/pytorch_dataset_consistent.pt')
+dataset_info = torch.load(f'datasets/{log}/pytorch_dataset_consistent.pt')
+if isinstance(dataset_info, dict) and 'dataset_dir' in dataset_info:
+    # Handle memory-mapped dataset
+    pytorch_dataset = MemoryMappedDataset(dataset_info['dataset_dir'])
+else:
+    # Regular dataset
+    pytorch_dataset = dataset_info
 pretrained_weights = f"datasets/{log}/mam_pretrained_model"
-
-config = Config(pytorch_dataset)
 
 # Load mappings
 mappings = torch.load(f'datasets/{log}/mappings_consistent.pt')
 
 # Add loop features to dataset
-from FeatureEngineering import add_loop_features
+loop_activities_by_outcome, time_sensitive_transitions = define_features(log)
+add_all_features(pytorch_dataset, log, mappings, loop_activities_by_outcome, time_sensitive_transitions)
 
-add_loop_features(pytorch_dataset, mappings, loop_activities_by_outcome)
+config = Config(pytorch_dataset)
 
 # Load the model
 model = MultitaskBERTModel(config, pretrained_weights=pretrained_weights).to(device)
@@ -48,12 +54,14 @@ def evaluate_example(model, dataset, index, device):
     print('\n=== Evaluate Example ===')
     model.eval()
     example = dataset[index]
+    # Handle missing loop features
+    loop_features = example.get('loop_features',
+                                torch.zeros(model.config.total_feature_dim))
     trace = example['trace'].unsqueeze(0).to(device)
     times = example['times'].unsqueeze(0).to(device)
     mask = example['mask'].unsqueeze(0).to(device)
     customer_type = example['customer_type'].unsqueeze(0).to(device)
-    loop_features = example['loop_features'].unsqueeze(0).to(device)
-
+    loop_features = loop_features.unsqueeze(0).to(device)
     # Ensure correct feature dimension
     expected_feat_dim = model.config.total_feature_dim
     if loop_features.shape[1] != expected_feat_dim:
@@ -132,8 +140,8 @@ def evaluate_per_concept(model, dataset, device):
             mask = example['mask'].unsqueeze(0).to(device)
             times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)
-            loop_features = example['loop_features'].unsqueeze(0).to(device)
-
+            loop_features = example.get('loop_features', torch.zeros(model.config.total_feature_dim)).unsqueeze(0).to(
+                device)
             # Ensure correct feature dimension
             expected_feat_dim = model.config.total_feature_dim
             if loop_features.shape[1] != expected_feat_dim:
@@ -235,8 +243,8 @@ def evaluate_model(model, dataset, device):
             mask = example['mask'].unsqueeze(0).to(device)
             times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)
-            loop_features = example['loop_features'].unsqueeze(0).to(device)
-
+            loop_features = example.get('loop_features', torch.zeros(model.config.total_feature_dim)).unsqueeze(0).to(
+                device)
             # Ensure correct feature dimension
             expected_feat_dim = model.config.total_feature_dim
             if loop_features.shape[1] != expected_feat_dim:
@@ -249,10 +257,16 @@ def evaluate_model(model, dataset, device):
             # Get predictions
             next_activity_logits, outcome_logits = model(trace, mask, times, loop_features, customer_type)
 
-            # Only consider non padded for nap
-            valid_positions = mask[0].cpu().bool()
-            true_activities = example['next_activity'].cpu()[valid_positions].tolist()
+            # Get actual sequence length from model output
+            seq_len = next_activity_logits.shape[1]  # [batch_size, seq_len, num_activities]
+
+            # Truncate masks and labels to match model output
+            valid_positions = mask[0, :seq_len].bool().cpu()
+            next_act_true = example['next_activity'][:seq_len].cpu()
+
+            # Get predictions and apply mask
             pred_activities = torch.argmax(next_activity_logits[0], dim=1).cpu()[valid_positions].tolist()
+            true_activities = next_act_true[valid_positions].tolist()
 
             all_true_next_activity.extend(true_activities)
             all_pred_next_activity.extend(pred_activities)
@@ -806,12 +820,14 @@ def analyze_prediction_errors(model, dataset, device, top_k=100):
     with torch.no_grad():
         for i in range(len(dataset)):
             example = dataset[i]
+            if 'loop_features' not in example:
+                example['loop_features'] = torch.zeros(model.config.total_feature_dim)
             trace = example['trace'].unsqueeze(0).to(device)
             mask = example['mask'].unsqueeze(0).to(device)
             times = example['times'].unsqueeze(0).to(device)
             customer_type = example['customer_type'].unsqueeze(0).to(device)
-            loop_features = example['loop_features'].unsqueeze(0).to(device)
-
+            loop_features = example.get('loop_features', torch.zeros(1, model.config.total_feature_dim)).unsqueeze(
+                0).to(device)
             # Ensure correct feature dimension
             expected_feat_dim = model.config.total_feature_dim
             if loop_features.shape[1] != expected_feat_dim:
@@ -823,11 +839,14 @@ def analyze_prediction_errors(model, dataset, device, top_k=100):
 
             # Get predictions
             next_act_logits, _ = model(trace, mask, times, loop_features, customer_type)
-            next_act_preds = torch.argmax(next_act_logits, dim=2)[0].cpu()
-            next_act_true = example['next_activity'].cpu()
+            seq_len = next_act_logits.shape[1]  # Get model's output length
+
+            # Truncate masks and labels to model's actual output length
+            valid_positions = mask[0, :seq_len].bool().cpu()
+            next_act_preds = torch.argmax(next_act_logits, dim=2)[0, :seq_len].cpu()
+            next_act_true = example['next_activity'][:seq_len].cpu()
 
             # Analyze errors
-            valid_positions = mask[0].cpu().bool()
             for true, pred in zip(next_act_true[valid_positions], next_act_preds[valid_positions]):
                 true_val = true.item()
                 pred_val = pred.item()

@@ -1,100 +1,111 @@
 import torch
 from collections import defaultdict
+import numpy as np
+from preprocess import MemoryMappedDataset
 
-# Define activities to monitor for each outcome
-loop_activities_by_outcome = {
-    0: ['Funnel_Offerte uitbrengen', 'Mailing_Controle rentekorting hyp.'],
-    # Activities that loop in unsuccessful cases
-    1: ['Funnel_Huismap vullen']  # Activities that loop in successful cases
-}
 
-# Define time-sensitive transitions and their thresholds
-time_sensitive_transitions = [
-    {
-        'act1': 'Funnel_Hebben afspraak',
-        'act2': 'Funnel_Offerte aanvraag',
-        'success_threshold': 222.0,
-        'failure_threshold': 2359.5
-    },
-    {
-        'act1': 'Funnel_Hebben afspraak',
-        'act2': 'Funnel_Plannen afspraak',
-        'success_threshold': 312.8,
-        'failure_threshold': 3060.7
-    },
-    {
-        'act1': 'Regelen_Bouwdepot',
-        'act2': 'Regelen_Bouwdepot',
-        'success_threshold': 10.8,
-        'failure_threshold': 203.5
-    },
-    {
-        'act1': 'Funnel_Huismap vullen',
-        'act2': 'Funnel_Hebben afspraak',
-        'success_threshold': 51.1,
-        'failure_threshold': 115.8
-    },
-    {
-        'act1': 'Huismap overig_Huismap voorbereiding',
-        'act2': 'Funnel_Hebben afspraak',
-        'success_threshold': 68.6,
-        'failure_threshold': 138.6
-    },
-    {
-        'act1': 'Funnel_Hebben afspraak',
-        'act2': 'Contact_Aankoop/verkoop',
-        'success_threshold': 44.6,
-        'failure_threshold': 118.1
-    },
-    {
-        'act1': 'Verkoop_OTD',
-        'act2': 'Funnel_Offerte aanvraag',
-        'success_threshold': 151.4,
-        'failure_threshold': 273.4
-    },
-    {
-        'act1': 'Funnel_Plannen afspraak',
-        'act2': 'Funnel_Offerte acceptatie',
-        'success_threshold': 31.9,
-        'failure_threshold': 116.3
-    },
-    {
-        'act1': 'Funnel_Offerte acceptatie',
-        'act2': 'Contact_Overig',
-        'success_threshold': 64.3,
-        'failure_threshold': 730.6
-    },
-    {
-        'act1': 'Online_OriÃ«ntatie',
-        'act2': 'Funnel_Offerte aanvraag',
-        'success_threshold': 1303.1,
-        'failure_threshold': 6843.4
-    },
-    {
-        'act1': 'Systeembrief_Informatie',
-        'act2': 'Regelen_Bouwdepot',
-        'success_threshold': 243.0,
-        'failure_threshold': 399.6
-    },
-    {
-        'act1': 'Funnel_Offerte acceptatie',
-        'act2': 'Funnel_Offerte uitbrengen',
-        'success_threshold': 168.0,
-        'failure_threshold': 228.0
-    },
-    {
-        'act1': 'Funnel_Offerte acceptatie',
-        'act2': 'Productgroepmutatie_Uitstroom',
-        'success_threshold': 864.0,
-        'failure_threshold': 1164.0
-    },
-    {
-        'act1': 'Funnel_Offerte acceptatie',
-        'act2': 'Productgroepmutatie_Instroom',
-        'success_threshold': 72.0,
-        'failure_threshold': 768.0
-    }
-]
+def define_features(log):
+    if log == 'mortgages':
+        # Define activities to monitor for each outcome
+        loop_activities_by_outcome = {
+            0: ['Funnel_Offerte uitbrengen', 'Mailing_Controle rentekorting hyp.'],
+            # Activities that loop in unsuccessful cases
+            1: ['Funnel_Huismap vullen']  # Activities that loop in successful cases
+        }
+
+        # Define time-sensitive transitions and their thresholds
+        time_sensitive_transitions = [
+            {
+                'act1': 'Funnel_Hebben afspraak',
+                'act2': 'Funnel_Offerte aanvraag',
+                'success_threshold': 222.0,
+                'failure_threshold': 2359.5
+            },
+            {
+                'act1': 'Funnel_Hebben afspraak',
+                'act2': 'Funnel_Plannen afspraak',
+                'success_threshold': 312.8,
+                'failure_threshold': 3060.7
+            },
+            {
+                'act1': 'Regelen_Bouwdepot',
+                'act2': 'Regelen_Bouwdepot',
+                'success_threshold': 10.8,
+                'failure_threshold': 203.5
+            },
+            {
+                'act1': 'Funnel_Huismap vullen',
+                'act2': 'Funnel_Hebben afspraak',
+                'success_threshold': 51.1,
+                'failure_threshold': 115.8
+            },
+            {
+                'act1': 'Huismap overig_Huismap voorbereiding',
+                'act2': 'Funnel_Hebben afspraak',
+                'success_threshold': 68.6,
+                'failure_threshold': 138.6
+            },
+            {
+                'act1': 'Funnel_Hebben afspraak',
+                'act2': 'Contact_Aankoop/verkoop',
+                'success_threshold': 44.6,
+                'failure_threshold': 118.1
+            },
+            {
+                'act1': 'Verkoop_OTD',
+                'act2': 'Funnel_Offerte aanvraag',
+                'success_threshold': 151.4,
+                'failure_threshold': 273.4
+            },
+            {
+                'act1': 'Funnel_Plannen afspraak',
+                'act2': 'Funnel_Offerte acceptatie',
+                'success_threshold': 31.9,
+                'failure_threshold': 116.3
+            },
+            {
+                'act1': 'Funnel_Offerte acceptatie',
+                'act2': 'Contact_Overig',
+                'success_threshold': 64.3,
+                'failure_threshold': 730.6
+            },
+            {
+                'act1': 'Online_OriÃ«ntatie',
+                'act2': 'Funnel_Offerte aanvraag',
+                'success_threshold': 1303.1,
+                'failure_threshold': 6843.4
+            },
+            {
+                'act1': 'Systeembrief_Informatie',
+                'act2': 'Regelen_Bouwdepot',
+                'success_threshold': 243.0,
+                'failure_threshold': 399.6
+            },
+            {
+                'act1': 'Funnel_Offerte acceptatie',
+                'act2': 'Funnel_Offerte uitbrengen',
+                'success_threshold': 168.0,
+                'failure_threshold': 228.0
+            },
+            {
+                'act1': 'Funnel_Offerte acceptatie',
+                'act2': 'Productgroepmutatie_Uitstroom',
+                'success_threshold': 864.0,
+                'failure_threshold': 1164.0
+            },
+            {
+                'act1': 'Funnel_Offerte acceptatie',
+                'act2': 'Productgroepmutatie_Instroom',
+                'success_threshold': 72.0,
+                'failure_threshold': 768.0
+            }
+        ]
+        return loop_activities_by_outcome, time_sensitive_transitions
+
+    elif log == 'application':
+        loop_activities_by_outcome = None
+        time_sensitive_transitions = None
+        return loop_activities_by_outcome, time_sensitive_transitions
 
 
 def add_loop_features(pytorch_dataset, activity_mappings, loop_activities_by_outcome, print_statistics=False):
@@ -235,16 +246,33 @@ def add_temporal_features(pytorch_dataset, activity_mappings, time_sensitive_tra
     return temporal_features
 
 
-def add_all_features(pytorch_dataset, activity_mappings, loop_activities_by_outcome,
+def add_all_features(pytorch_dataset, log, activity_mappings, loop_activities_by_outcome,
                      time_sensitive_transitions, print_statistics=False):
     """Combined function to add both loop and temporal features"""
+    # Define features based on dataset
+    loop_activities_by_outcome, time_sensitive_transitions = define_features(log)
 
-    # Add loop features
-    add_loop_features(pytorch_dataset, activity_mappings, loop_activities_by_outcome)
+    # Initialize empty features if not using loop/temporal features
+    if loop_activities_by_outcome is None and time_sensitive_transitions is None:
+        # Handle memory-mapped dataset case
+        if isinstance(pytorch_dataset, MemoryMappedDataset):
+            num_traces = len(pytorch_dataset)
+        elif hasattr(pytorch_dataset, 'traces'):  # Regular dataset
+            num_traces = len(pytorch_dataset.traces)
+        else:  # Dictionary case
+            num_traces = len(pytorch_dataset['traces'])
+            pytorch_dataset['loop_features'] = None  # Initialize if needed
+        # Create empty feature tensor
+        pytorch_dataset.loop_features = torch.zeros((num_traces, 0), dtype=torch.float)
+        return
 
-    # Add temporal features
-    temporal_features = add_temporal_features(pytorch_dataset, activity_mappings,
-                                              time_sensitive_transitions)
+    # Original feature engineering code for datasets that need it
+    if loop_activities_by_outcome:
+        add_loop_features(pytorch_dataset, activity_mappings, loop_activities_by_outcome)
+
+    if time_sensitive_transitions:
+        temporal_features = add_temporal_features(pytorch_dataset, activity_mappings,
+                                                  time_sensitive_transitions)
 
     # Combine features
     pytorch_dataset.loop_features = torch.cat([
@@ -266,56 +294,85 @@ def add_all_features(pytorch_dataset, activity_mappings, loop_activities_by_outc
             print(f"{feature}: {count} traces ({percentage:.2f}%)")
 
 
-def analyze_feature_positions_for_bucketing(dataset, activity_mappings, loop_activities_by_outcome,
+def analyze_feature_positions_for_bucketing(dataset, log, activity_mappings,
+                                            loop_activities_by_outcome,
                                             time_sensitive_transitions):
-    """Analyze feature positions for bucketing using existing detection logic"""
-    feature_positions = defaultdict(list)
+    """Create 3 non-overlapping buckets considering both trace lengths and feature positions"""
 
-    # Use existing id_to_activity mapping
+    loop_activities_by_outcome, time_sensitive_transitions = define_features(log)
+    # 1. Collect trace lengths and feature positions
+    trace_lengths = []
+    feature_positions = []
+
     id_to_activity = {v: k for k, v in activity_mappings['activity_to_id'].items()}
 
     for i in range(len(dataset)):
         trace = dataset.traces[i]
-        times = dataset.times[i]
-        trace_list = trace[trace != 0].tolist()
+        valid_mask = trace != 0
+        trace_length = valid_mask.sum().item()
+        trace_list = trace[valid_mask].tolist()
         trace_activities = [id_to_activity[x] for x in trace_list]
 
-        # Check for loops using existing logic
-        for j in range(len(trace_activities) - 1):
-            if trace_activities[j] == trace_activities[j + 1]:
+        # Record feature positions
+        for j in range(len(trace_activities)):
+            # Check for loop features
+            if j > 0 and trace_activities[j] == trace_activities[j - 1]:
                 for outcome, activities in loop_activities_by_outcome.items():
                     if trace_activities[j] in activities:
-                        # print(f"Loop detected at position {j+1} for activity {trace_activities[j]}")
-                        feature_positions['loops'].append(j + 1)
+                        feature_positions.append(j + 1)  # 1-based position
 
-        # Check for time-sensitive transitions using existing logic
-        valid_mask = trace != 0
-        time_list = times[valid_mask].tolist()
-        for j in range(len(trace_activities) - 1):
-            current_act = trace_activities[j]
-            next_act = trace_activities[j + 1]
-            for trans in time_sensitive_transitions:
-                if current_act == trans['act1'] and next_act == trans['act2']:
-                    time_diff = abs(time_list[j + 1] - time_list[j])
-                    threshold = (trans['success_threshold'] + trans['failure_threshold']) / 2
-                    # print(f"Time transition detected at position {j+1} between {current_act} -> {next_act}")
-                    # print(f"Time difference: {time_diff:.2f}, Threshold: {threshold:.2f}")
-                    feature_positions['time_transitions'].append(j + 1)
+            # Check for time-sensitive transitions
+            if j < len(trace_activities) - 1:
+                current_act = trace_activities[j]
+                next_act = trace_activities[j + 1]
+                for trans in time_sensitive_transitions:
+                    if current_act == trans['act1'] and next_act == trans['act2']:
+                        feature_positions.append(j + 1)  # 1-based position
 
-    # Get unique positions where features occur
-    all_positions = sorted(set(feature_positions['loops'] + feature_positions['time_transitions']))
+        trace_lengths.append(trace_length)
 
-    # Create buckets based on feature positions
-    buckets = {}
-    if all_positions:
-        # First bucket: start to first feature
-        buckets[f"short (1-{all_positions[0]})"] = (1, all_positions[0])
+    # 2. Determine characteristic positions
+    feature_positions = sorted(feature_positions)
+    if feature_positions:
+        # Get median feature position
+        median_feature_pos = feature_positions[len(feature_positions) // 2]
 
-        # Middle bucket(s)
-        mid_point = all_positions[len(all_positions) // 2]
-        buckets[f"medium ({all_positions[0] + 1}-{mid_point})"] = (all_positions[0] + 1, mid_point)
+        # Get positions at 25th and 75th percentiles
+        q1_pos = feature_positions[int(len(feature_positions) * 0.25)]
+        q3_pos = feature_positions[int(len(feature_positions) * 0.75)]
+    else:
+        # Fallback to trace length quartiles
+        q1_pos = np.percentile(trace_lengths, 25)
+        q3_pos = np.percentile(trace_lengths, 75)
+        median_feature_pos = np.median(trace_lengths)
 
-        # Last bucket: mid point to end
-        buckets[f"long ({mid_point + 1}+)"] = (mid_point + 1, None)
+    # 3. Create non-overlapping buckets using both metrics
+    buckets = {
+        'short': (1, max(2, q1_pos - 1)),  # Ensure minimum length 2
+        'medium': (q1_pos, q3_pos),
+        'long': (q3_pos + 1, None)  # None indicates no upper bound
+    }
+
+    # 4. Verify against actual trace lengths
+    min_length = min(trace_lengths)
+    max_length = max(trace_lengths)
+
+    # Adjust if buckets exceed actual lengths
+    if buckets['short'][1] > max_length:
+        buckets['short'] = (min_length, max_length)
+        buckets['medium'] = (max_length + 1, max_length)  # Empty bucket
+        buckets['long'] = (max_length + 1, None)
+    elif buckets['medium'][1] > max_length:
+        buckets['medium'] = (buckets['medium'][0], max_length)
+        buckets['long'] = (max_length + 1, None)
+
+    # 5. Add debug output
+    print("\n=== Feature-Based Bucketing ===")
+    print(f"Median feature position: {median_feature_pos}")
+    print(f"25th percentile feature: {q1_pos}, 75th percentile: {q3_pos}")
+    print("Final buckets:")
+    for name, (start, end) in buckets.items():
+        count = sum(1 for l in trace_lengths if start <= l <= (end if end else max_length))
+        print(f"{name} ({start}-{end or '∞'}): {count} traces")
 
     return buckets
