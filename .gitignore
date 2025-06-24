@@ -1,0 +1,12 @@
+*.json
+*.h5
+*.txt
+*.csv
+*.safetensors
+*.pickle
+*.pt
+*.log
+*.png
+*.jpg
+*.jpeg
+*.xes
