@@ -5,6 +5,7 @@ from sys import argv
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+import re
 
 def calculate_metrics(y_true, y_pred, prob_scores=None):
     """Calculate all metrics for a given set of predictions."""
@@ -85,7 +86,24 @@ def load_all_prediction_files(base_path, model_name):
     predictions_list = []
     
     # Handle BERT and other competitors differently
-    if model_name != "ModernBERT":
+    if model_name == "BERT":
+        # Look for run directories
+        run_dirs = [d for d in os.listdir(base_path) if d.startswith('results_')]
+        for run_dir in run_dirs:
+            try:
+                run_path = os.path.join(base_path, run_dir)
+                nap_file = os.path.join(run_path, 'predictions_nap.csv')
+                outcome_file = os.path.join(run_path, 'predictions_outcome.csv')
+                entry = {'run_id': run_dir}
+                if os.path.exists(nap_file):
+                    entry['activity'] = pd.read_csv(nap_file)
+                if os.path.exists(outcome_file):
+                    entry['outcome'] = pd.read_csv(outcome_file)
+                if 'activity' in entry or 'outcome' in entry:
+                    predictions_list.append(entry)
+            except Exception as e:
+                print(f"Error loading predictions from {run_dir}: {str(e)}")
+    elif model_name != "ModernBERT":
         # Look for run directories
         run_dirs = [d for d in os.listdir(base_path) if d.startswith('results_')]
         for run_dir in run_dirs:
@@ -183,6 +201,40 @@ def evaluate_predictions(dataset_name, model_name):
             for task in ['activity', 'outcome']:
                 if metrics[task]:
                     calculate_average_metrics(metrics[task], output_dir, task, f"{model_name}_{config}")
+    elif model_name == "BERT":
+        output_dir = f"./results/{dataset_name}/BERT"
+        os.makedirs(output_dir, exist_ok=True)
+        for entry in predictions_list:
+            run_id = entry['run_id']
+            run_suffix = f"_{run_id.split('_')[-1]}"
+            run_results = {}
+            # Evaluate activity (NAP)
+            if 'activity' in entry:
+                df = entry['activity']
+                run_results['activity'] = evaluate_single_prediction(
+                    df,
+                    task_type='activity',
+                    output_dir=output_dir,
+                    model_name=model_name,
+                    metrics_suffix=run_suffix
+                )['activity']
+                all_metrics['activity'].append(run_results['activity'])
+            # Evaluate outcome
+            if 'outcome' in entry:
+                df = entry['outcome']
+                run_results['outcome'] = evaluate_single_prediction(
+                    df,
+                    task_type='outcome',
+                    output_dir=output_dir,
+                    model_name=model_name,
+                    metrics_suffix=run_suffix
+                )['outcome']
+                all_metrics['outcome'].append(run_results['outcome'])
+            results[run_id] = run_results
+        # Calculate and save averaged metrics
+        for task in ['activity', 'outcome']:
+            if all_metrics[task]:
+                calculate_average_metrics(all_metrics[task], output_dir, task, model_name)
     else:
         # For competitors, evaluate each run separately
         for predictions in predictions_list:
@@ -347,204 +399,192 @@ def evaluate_single_prediction(predictions, task_type=None, output_dir=None, mod
     print("\nEvaluation complete!")    
     return results
             
-def load_class_distributions(dataset_name, model_name, run_dir=None, config_dir=None):
-    """Load class distribution data for plotting with new directory structure."""
-    base_path = f"../Model_test/datasets/{dataset_name}"
-    
+def load_class_distributions(dataset_name):
+    """
+    Load class distribution data for plotting.
+    Uses the first available run/config for the dataset, as distributions are identical within the dataset.
+    """
+    print(f"[DEBUG] Loading class distributions for dataset: {dataset_name}")
+    base_dir = f"../ModernBERT/datasets/{dataset_name}"
     try:
-        if model_name == "ModernBERT":
-            if run_dir and config_dir:
-                dist_path = os.path.join(base_path, run_dir, config_dir)
-                activity_dist = pd.read_csv(os.path.join(dist_path, 'activity_class_distribution.csv'), index_col=0)
-                outcome_dist = pd.read_csv(os.path.join(dist_path, 'outcome_class_distribution.csv'), index_col=0)
-            else:
-                return None, None
-        else:
-            base_path = f"../Competitors/{model_name}/datasets/{dataset_name}"
-            activity_dist = pd.read_csv(f"{base_path}/activity_class_distribution.csv", index_col=0)
-            outcome_dist = pd.read_csv(f"{base_path}/outcome_class_distribution.csv", index_col=0)
-        return activity_dist, outcome_dist
+        # Find any run/config directory
+        for run_dir in os.listdir(base_dir):
+            run_path = os.path.join(base_dir, run_dir)
+            if not os.path.isdir(run_path):
+                continue
+            for config_dir in os.listdir(run_path):
+                config_path = os.path.join(run_path, config_dir)
+                if not os.path.isdir(config_path):
+                    continue
+                act_file = os.path.join(config_path, f'activity_class_distribution_{config_dir}.csv')
+                out_file = os.path.join(config_path, f'outcome_class_distribution_{config_dir}.csv')
+                print(f"[DEBUG] Checking for files: {act_file}, {out_file}")
+                if os.path.exists(act_file) and os.path.exists(out_file):
+                    print(f"[DEBUG] Found class distribution files: {act_file}, {out_file}")
+                    activity_dist = pd.read_csv(act_file, index_col=0)
+                    outcome_dist = pd.read_csv(out_file, index_col=0)
+                    return activity_dist, outcome_dist
+        print("[DEBUG] No class distribution files found.")
+        return None, None
     except Exception as e:
-        print(f"Error loading class distributions: {str(e)}")
+        print(f"[DEBUG] Error loading class distributions: {str(e)}")
         return None, None
     
-def get_metric(prefix_metrics, metric):
-    """Return lists of prefix lengths, metric values, and sample counts."""
-    if not prefix_metrics or not isinstance(prefix_metrics, list):
-        return [], [], []
-    
-    # Convert list of metrics to proper format
-    xs = [m['Length'] for m in prefix_metrics]
-    ys = [m[metric] for m in prefix_metrics]
-    samples = [m['NumSamples'] for m in prefix_metrics]
-    
-    return xs, ys, samples
+def parse_averaged_metrics_file(filepath):
+    """
+    Parse an averaged metrics file and return a dictionary:
+    {
+        metric_name: {
+            'lengths': [...],
+            'means': [...],
+            'stds': [...],
+            'samples': [...]
+        },
+        ...
+    }
+    """
+    metrics = {}
+    current_metric = None
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    in_prefix_section = False
+    for line in lines:
+        if line.strip().startswith("Metrics per prefix length:"):
+            in_prefix_section = True
+            continue
+        if in_prefix_section:
+            if re.match(r'^\d+;', line):
+                parts = line.strip().split(';')
+                length = int(parts[0])
+                metric = parts[1]
+                mean = float(parts[2])
+                std = float(parts[3])
+                samples = int(parts[4])
+                if metric not in metrics:
+                    metrics[metric] = {'lengths': [], 'means': [], 'stds': [], 'samples': []}
+                metrics[metric]['lengths'].append(length)
+                metrics[metric]['means'].append(mean)
+                metrics[metric]['stds'].append(std)
+                metrics[metric]['samples'].append(samples)
+    return metrics
 
-def create_metric_plot(ax, x_my, y_my, dist_my, x_comp, y_comp, dist_comp, metric_name, comp_name, my_name="ModernBERT", task="activity"):
-    """Create a styled plot with stacked bar sample counts on secondary axis"""
-    # Main metrics lines
-    if x_comp and y_comp:
-        ax.plot(x_comp, y_comp, marker='o', linewidth=2, markersize=8,
-                color='green' if comp_name == "CRTP-LSTM" else 'orange' if comp_name == "ORANGE" else 'red',
-                label=comp_name, zorder=3)
-    ax.plot(x_my, y_my, marker='s', linewidth=2, markersize=8,
-            color='blue', label=my_name, zorder=3)
+def plot_metric_with_ci_and_class_dist(ax, metric_data, label, color, class_dist, task):
+    """
+    Plot mean and confidence interval for a metric, and add class distribution bars.
+    """
+    x = metric_data['lengths']
+    y = metric_data['means']
+    yerr = metric_data['stds']
+    ax.plot(x, y, label=label, color=color)
+    ax.fill_between(x, [m-s for m, s in zip(y, yerr)], [m+s for m, s in zip(y, yerr)],
+                    color=color, alpha=0.2)
     
-    # Titles and labels
-    ax.set_title(f'{metric_name} vs Prefix Length', fontsize=14, pad=20)
-    ax.set_xlabel('Prefix Length', fontsize=12)
-    ax.set_ylabel(metric_name, fontsize=12)
-    
-    ax.grid(True, linestyle='--', alpha=0.7)
-    
-    # Value labels for metrics
-    label_every = max(1, len(x_comp) // 5)
-    y_offset = 10
-    for idx, (x, y) in enumerate(zip(x_comp, y_comp)):
-        if idx % label_every == 0:
-            ax.annotate(f'{y:.3f}', (x, y),
-                      textcoords="offset points",
-                      xytext=(0, y_offset),
-                      ha='center', fontsize=9, alpha=0.7)
-            y_offset *= -1
-
-    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=10))
-    
-    # Y-axis limits for metrics
-    all_y = (y_comp + y_my) if (x_comp and x_my) else (y_comp if x_comp else y_my)
-    if all_y:
-        y_min, y_max = min(all_y), max(all_y)
-        ax.set_ylim(max(0, y_min - 0.05), min(1.0, y_max + 0.05))
-    
-    # Secondary axis for sample distribution
-    ax2 = ax.twinx()
-    
-    # Set up bars
-    bar_width = 0.35
-    class_columns = [col for col in dist_my.columns if f'{task}_class_' in col]
-    n_classes = len(class_columns)
-    
-    # Create color palette for classes
-    colors = plt.cm.Set3(np.linspace(0, 1, n_classes))
-    
-    # Plot stacked bars for ModernBERT
-    bottom_my = np.zeros(len(x_my))
-    for i, col in enumerate(class_columns):
-        values = dist_my[col].values
-        ax2.bar(np.array(x_my) - bar_width/2, values, bar_width,
-                bottom=bottom_my, color=colors[i], alpha=0.5,
-                label=f'{my_name} {col.split("_")[-1]}')
-        bottom_my += values
-    
-    # Plot stacked bars for competitor
-    if dist_comp is not None:
-        bottom_comp = np.zeros(len(x_comp))
+    # Plot class distribution as stacked bars on secondary axis
+    if class_dist is not None:
+        ax2 = ax.twinx()
+        class_columns = [col for col in class_dist.columns if f'{task}_class_' in col]
+        n_classes = len(class_columns)
+        colors = plt.cm.Set3(np.linspace(0, 1, n_classes))
+        bottom = np.zeros(len(x))
         for i, col in enumerate(class_columns):
-            values = dist_comp[col].values
-            ax2.bar(np.array(x_comp) + bar_width/2, values, bar_width,
-                   bottom=bottom_comp, color=colors[i], alpha=0.5,
-                   label=f'{comp_name} {col.split("_")[-1]}')
-            bottom_comp += values
-    
-    ax2.set_ylabel('Number of Samples', color='gray')
-    
-    # Legend
-    handles1, labels1 = ax.get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(handles1 + handles2, labels1 + labels2, 
-             loc='upper center', bbox_to_anchor=(0.5, -0.15), 
-             ncol=3, fontsize=10)
+            # Align class distribution to prefix lengths
+            values = []
+            for length in x:
+                if str(length) in class_dist.index or int(length) in class_dist.index:
+                    values.append(class_dist.loc[length, col])
+                else:
+                    values.append(0)
+            ax2.bar(np.array(x), values, width=0.35, bottom=bottom, color=colors[i], alpha=0.3, label=f'Class {col.split("_")[-1]}')
+            bottom += np.array(values)
+        ax2.set_ylabel('Num Samples (class dist)', color='gray')
+        ax2.tick_params(axis='y', labelcolor='gray')
+        # Only show legend for the first metric subplot
+        if ax.get_subplotspec().colspan.start == 0:
+            handles2, labels2 = ax2.get_legend_handles_labels()
+            # ax2.legend(handles2, labels2, loc='upper right', fontsize=8)
+    else:
+        ax2 = None
+    return ax, ax2
 
-def create_comparison_plots(dataset_name, modernbert_metrics, competitor_metrics):
-    """Create comparison plots for each ModernBERT configuration."""
-    plt.style.use('seaborn-v0_8')
-    sns.set_palette("husl")
-    
-    # For each ModernBERT configuration
-    for config_key, mb_metrics in modernbert_metrics.items():
-        run_id, config = config_key.split('/')
-        plot_dir = f"./results/{dataset_name}/{run_id}/{config}/plots"
-        os.makedirs(plot_dir, exist_ok=True)
-        
-        # Load class distributions for this configuration
-        modernbert_act_dist, modernbert_out_dist = load_class_distributions(
-            dataset_name, "ModernBERT", run_id, config
-        )
-        
-        # Create comparison plots for each competitor
-        for competitor, comp_metrics in competitor_metrics.items():
-            if not comp_metrics.get('default'):
+def plot_comparison_from_averaged(
+    dataset_name, 
+    modernbert_dir, 
+    competitor_dir, 
+    task, 
+    competitor_name, 
+    metrics=['Accuracy', 'F1', 'ROC_AUC'],
+    save_path=None,
+    class_dist=None
+):
+    """
+    Plot comparison between ModernBERT and a competitor using averaged metrics,
+    and add class distribution bars.
+    """
+    mb_file = f"{modernbert_dir}/{task}_metrics_averaged.txt"
+    comp_file = f"{competitor_dir}/{task}_metrics_averaged.txt"
+    mb_metrics = parse_averaged_metrics_file(mb_file)
+    comp_metrics = parse_averaged_metrics_file(comp_file)
+    colors = {'ModernBERT': 'blue', competitor_name: 'orange'}
+    plt.figure(figsize=(18, 5))
+    for i, metric in enumerate(metrics):
+        ax = plt.subplot(1, len(metrics), i+1)
+        if metric in mb_metrics:
+            plot_metric_with_ci_and_class_dist(ax, mb_metrics[metric], 'ModernBERT', colors['ModernBERT'], class_dist, task)
+        if metric in comp_metrics:
+            plot_metric_with_ci_and_class_dist(ax, comp_metrics[metric], competitor_name, colors[competitor_name], None, task)
+        ax.set_title(f"{metric} vs Prefix Length")
+        ax.set_xlabel("Prefix Length")
+        ax.set_ylabel(metric)
+        ax.legend()
+        ax.grid(True)
+    plt.tight_layout()
+    if save_path is None:
+        save_path = f"./results/{dataset_name}/comparison_{task}_{competitor_name}.png"
+    plt.savefig(save_path, dpi=300)
+    print(f"Saved comparison plot: {save_path}")
+    plt.close()
+
+def create_comparison_plots_from_averaged(dataset_name, competitors=["CRTP-LSTM", "ORANGE", "BERT"]):
+    """
+    For each ModernBERT configuration, create comparison plots with each competitor
+    using the averaged metrics files for both activity and outcome tasks.
+    Also adds class distribution bars from any ModernBERT run/config.
+    """
+    # Load class distributions once per dataset
+    activity_class_dist, outcome_class_dist = load_class_distributions(dataset_name)
+    modernbert_base = f"./results/{dataset_name}/ModernBERT"
+    for config in os.listdir(modernbert_base):
+        config_dir = os.path.join(modernbert_base, config)
+        if not os.path.isdir(config_dir):
+            continue
+        for task in ["activity", "outcome"]:
+            mb_avg_file = os.path.join(config_dir, f"{task}_metrics_averaged.txt")
+            if not os.path.exists(mb_avg_file):
+                print(f"[INFO] Skipping {mb_avg_file} (not found)")
                 continue
-        
-        # Load class distributions
-        modernbert_act_dist, modernbert_out_dist = load_class_distributions(dataset_name, "ModernBERT")
-        competitor_act_dist, competitor_out_dist = load_class_distributions(dataset_name, competitor)
-            
-        # Activity prediction plots
-        if 'activity' in metrics and metrics['activity'] and 'activity' in modernbert_metrics and modernbert_metrics['activity']:
-            try:
-                fig1, axs1 = plt.subplots(1, 2, figsize=(16, 7))
-            
-                my_metrics = modernbert_metrics['activity'][1]
-                comp_metrics = metrics['activity'][1]
+            for competitor in competitors:
+                comp_dir = f"./results/{dataset_name}/{competitor}"
+                comp_avg_file = os.path.join(comp_dir, f"{task}_metrics_averaged.txt")
+                if not os.path.exists(comp_avg_file):
+                    print(f"[INFO] Skipping {comp_avg_file} (not found)")
+                    continue
+                print(f"[INFO] Plotting {task} comparison: {config} vs {competitor}")
+                save_dir = os.path.join(config_dir, "plots")
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"{task}_comparison_{competitor}.png")
+                # Only plot ROC_AUC for outcome
+                metrics_to_plot = ['Accuracy', 'F1', 'ROC_AUC'] if task == "outcome" else ['Accuracy', 'F1']
+                plot_comparison_from_averaged(
+                    dataset_name=dataset_name,
+                    modernbert_dir=config_dir,
+                    competitor_dir=comp_dir,
+                    task=task,
+                    competitor_name=competitor,
+                    metrics=metrics_to_plot,
+                    save_path=save_path,
+                    class_dist=activity_class_dist if task == "activity" else outcome_class_dist
+                )
                 
-                # Extract metrics
-                x_acc_my, y_acc_my, _ = get_metric(my_metrics, "Accuracy")
-                x_acc_comp, y_acc_comp, _ = get_metric(comp_metrics, "Accuracy")
-                x_f1_my, y_f1_my, _ = get_metric(my_metrics, "F1")
-                x_f1_comp, y_f1_comp, _ = get_metric(comp_metrics, "F1")
-                
-                if x_acc_my and x_acc_comp:
-                    create_metric_plot(axs1[0], x_acc_my, y_acc_my, modernbert_act_dist, 
-                                    x_acc_comp, y_acc_comp, competitor_act_dist,
-                                    "Accuracy", competitor, task="activity")
-                    create_metric_plot(axs1[1], x_f1_my, y_f1_my, modernbert_act_dist,
-                                    x_f1_comp, y_f1_comp, competitor_act_dist,
-                                    "F1 Score", competitor, task="activity")
-                    
-                    plt.tight_layout()
-                    plt.savefig(f'{plot_dir}/nap_{competitor.lower()}_comparison.png', 
-                              dpi=300, bbox_inches='tight')
-                    print(f"Saved activity prediction plots for {competitor}")
-                plt.close(fig1)
-            except Exception as e:
-                print(f"Error creating activity plots for {competitor}: {str(e)}")
-        
-        # Outcome prediction plots
-        if 'outcome' in metrics and metrics['outcome'] and 'outcome' in modernbert_metrics and modernbert_metrics['outcome']:
-            try:
-                fig2, axs2 = plt.subplots(1, 3, figsize=(21, 7))
-                
-                my_metrics = modernbert_metrics['outcome'][1]
-                comp_metrics = metrics['outcome'][1]
-                
-                # Extract metrics
-                x_acc_my, y_acc_my, _ = get_metric(my_metrics, "Accuracy")
-                x_acc_comp, y_acc_comp, _ = get_metric(comp_metrics, "Accuracy")
-                x_f1_my, y_f1_my, _ = get_metric(my_metrics, "F1")
-                x_f1_comp, y_f1_comp, _ = get_metric(comp_metrics, "F1")
-                x_roc_my, y_roc_my, _ = get_metric(my_metrics, "ROC_AUC")
-                x_roc_comp, y_roc_comp, _ = get_metric(comp_metrics, "ROC_AUC")
-                
-                if x_acc_my and x_acc_comp:
-                    create_metric_plot(axs2[0], x_acc_my, y_acc_my, modernbert_out_dist,
-                                    x_acc_comp, y_acc_comp, competitor_out_dist,
-                                    "Accuracy", competitor, task="outcome")
-                    create_metric_plot(axs2[1], x_f1_my, y_f1_my, modernbert_out_dist,
-                                    x_f1_comp, y_f1_comp, competitor_out_dist,
-                                    "F1 Score", competitor, task="outcome")
-                    create_metric_plot(axs2[2], x_roc_my, y_roc_my, modernbert_out_dist,
-                                    x_roc_comp, y_roc_comp, competitor_out_dist,
-                                    "ROC AUC", competitor, task="outcome")
-                    
-                    plt.tight_layout()
-                    plt.savefig(f'{plot_dir}/outcome_{competitor.lower()}_comparison.png',
-                              dpi=300, bbox_inches='tight')
-                    print(f"Saved outcome prediction plots for {competitor}")
-                plt.close(fig2)
-            except Exception as e:
-                print(f"Error creating outcome plots for {competitor}: {str(e)}")
-
 def main():    
     dataset_name = argv[1]
         
@@ -559,7 +599,6 @@ def main():
     }
     
     # Create comparison plots for each ModernBERT configuration
-    create_comparison_plots(dataset_name, modernbert_results, competitor_results)
-
+    create_comparison_plots_from_averaged(dataset_name)
 if __name__ == "__main__":
     main()
