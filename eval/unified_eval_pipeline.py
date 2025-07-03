@@ -544,9 +544,55 @@ def plot_comparison_from_averaged(
     print(f"Saved comparison plot: {save_path}")
     plt.close()
 
-def create_comparison_plots_from_averaged(dataset_name, competitors=["CRTP-LSTM", "ORANGE", "BERT"]):
+
+def plot_multi_comparison_from_averaged(
+    dataset_name,
+    model_dirs,  # dict: {model_name: dir}
+    task,
+    metrics=['Accuracy', 'F1', 'ROC_AUC'],
+    save_path=None,
+    class_dist=None,
+    colors=None
+):
     """
-    For each ModernBERT configuration, create comparison plots with each competitor
+    Plot comparison between multiple models using averaged metrics,
+    and add class distribution bars.
+    """
+    if colors is None:
+        colors = {'ModernBERT': 'green', 'BERT': 'blue', 'ORANGE': 'orange', 'CRTP-LSTM': 'red'}
+    plt.figure(figsize=(18, 5))
+    # Parse metrics for all models
+    all_metrics = {}
+    for model_name, model_dir in model_dirs.items():
+        avg_file = f"{model_dir}/{task}_metrics_averaged.txt"
+        if os.path.exists(avg_file):
+            all_metrics[model_name] = parse_averaged_metrics_file(avg_file)
+        else:
+            print(f"[INFO] Skipping {avg_file} (not found)")
+    for i, metric in enumerate(metrics):
+        ax = plt.subplot(1, len(metrics), i+1)
+        for model_name, metrics_dict in all_metrics.items():
+            if metric in metrics_dict:
+                plot_metric_with_ci_and_class_dist(
+                    ax, metrics_dict[metric], model_name, colors.get(model_name, None),
+                    class_dist if model_name == "ModernBERT" else None, task
+                )
+        ax.set_title(f"{metric} vs Prefix Length")
+        ax.set_xlabel("Prefix Length")
+        ax.set_ylabel(metric)
+        ax.legend()
+        ax.grid(True)
+    plt.tight_layout()
+    if save_path is None:
+        save_path = f"./results/{dataset_name}/comparison_{task}_all.png"
+    plt.savefig(save_path, dpi=300)
+    print(f"Saved comparison plot: {save_path}")
+    plt.close()
+    
+
+def create_comparison_plots_from_averaged(dataset_name):
+    """
+    For each ModernBERT configuration, create a single comparison plot with all relevant competitors
     using the averaged metrics files for both activity and outcome tasks.
     Also adds class distribution bars from any ModernBERT run/config.
     """
@@ -562,41 +608,51 @@ def create_comparison_plots_from_averaged(dataset_name, competitors=["CRTP-LSTM"
             if not os.path.exists(mb_avg_file):
                 print(f"[INFO] Skipping {mb_avg_file} (not found)")
                 continue
-            for competitor in competitors:
-                comp_dir = f"./results/{dataset_name}/{competitor}"
+            # Choose competitors for each task
+            if task == "activity":
+                competitors = ["BERT", "CRTP-LSTM"]
+                metrics_to_plot = ['Accuracy', 'F1']
+                class_dist = activity_class_dist
+            else:
+                competitors = ["BERT", "ORANGE"]
+                metrics_to_plot = ['Accuracy', 'F1', 'ROC_AUC']
+                class_dist = outcome_class_dist
+            # Build model_dirs dict
+            model_dirs = {"ModernBERT": config_dir}
+            for comp in competitors:
+                comp_dir = f"./results/{dataset_name}/{comp}"
                 comp_avg_file = os.path.join(comp_dir, f"{task}_metrics_averaged.txt")
-                if not os.path.exists(comp_avg_file):
+                if os.path.exists(comp_avg_file):
+                    model_dirs[comp] = comp_dir
+                else:
                     print(f"[INFO] Skipping {comp_avg_file} (not found)")
-                    continue
-                print(f"[INFO] Plotting {task} comparison: {config} vs {competitor}")
-                save_dir = os.path.join(config_dir, "plots")
-                os.makedirs(save_dir, exist_ok=True)
-                save_path = os.path.join(save_dir, f"{task}_comparison_{competitor}.png")
-                # Only plot ROC_AUC for outcome
-                metrics_to_plot = ['Accuracy', 'F1', 'ROC_AUC'] if task == "outcome" else ['Accuracy', 'F1']
-                plot_comparison_from_averaged(
-                    dataset_name=dataset_name,
-                    modernbert_dir=config_dir,
-                    competitor_dir=comp_dir,
-                    task=task,
-                    competitor_name=competitor,
-                    metrics=metrics_to_plot,
-                    save_path=save_path,
-                    class_dist=activity_class_dist if task == "activity" else outcome_class_dist
-                )
+            if len(model_dirs) < 2:
+                print(f"[INFO] Not enough models for {task} in {config}, skipping plot.")
+                continue
+            save_dir = os.path.join(config_dir, "plots")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{task}_comparison_all.png")
+            plot_multi_comparison_from_averaged(
+                dataset_name=dataset_name,
+                model_dirs=model_dirs,
+                task=task,
+                metrics=metrics_to_plot,
+                save_path=save_path,
+                class_dist=class_dist
+            )
                 
 def main():    
     dataset_name = argv[1]
         
-    # Evaluate ModernBERT with all configurations
-    modernbert_results = evaluate_predictions(dataset_name, "ModernBERT")
+    # # Evaluate ModernBERT with all configurations
+    # modernbert_results = evaluate_predictions(dataset_name, "ModernBERT")
     
-    # Evaluate competitors
-    competitor_results = {
-        "CRTP-LSTM": evaluate_predictions(dataset_name, "CRTP-LSTM"),
-        "ORANGE": evaluate_predictions(dataset_name, "ORANGE"),
-        "BERT": evaluate_predictions(dataset_name, "BERT")
-    }
+    # # Evaluate competitors
+    # competitor_results = {
+    #     "CRTP-LSTM": evaluate_predictions(dataset_name, "CRTP-LSTM"),
+    #     "ORANGE": evaluate_predictions(dataset_name, "ORANGE"),
+    #     "BERT": evaluate_predictions(dataset_name, "BERT")
+    # }
     
     # Create comparison plots for each ModernBERT configuration
     create_comparison_plots_from_averaged(dataset_name)
